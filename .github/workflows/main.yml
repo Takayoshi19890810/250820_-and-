@@ -2,8 +2,8 @@ name: Daily News Scraper & Gemini Classifier
 
 on:
   schedule:
-    # 毎日 JST 15:10 実行（UTC 06:10）
-    - cron: '10 6 * * *'
+    # 毎日 JST 15:00 実行（UTC 06:00）
+    - cron: '0 6 * * *'
   workflow_dispatch:
 
 jobs:
