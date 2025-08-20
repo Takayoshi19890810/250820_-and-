@@ -1,0 +1,5 @@
+gspread
+selenium
+webdriver_manager
+requests
+beautifulsoup4
