@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 まとめシートのみ出力 / 今日の YYMMDD に、昨日15:00〜今日14:59 の記事を集約
++ Yahoo 記事のコメント数を F列に記載（まず総数表示を正規表現で取得、ダメならページ巡回）
 + Gemini を「バッチ推論」で使用し、C列タイトル → G列(ポジ/ネガ/ニュートラル)・H列(カテゴリ) を一括付与
-+ Yahoo 記事のコメント数を取得して F列に記載（/comments?page=N を Selenium で巡回して数える）
 """
 
 import os
@@ -279,7 +279,6 @@ def get_yahoo_news(keyword: str):
             title, source = extract_title_and_source_from_yahoo(html)
             pub = extract_datetime_from_article(html)
 
-            # タイトル最低限ガード
             if not title or title == "Yahoo!ニュース":
                 continue
             if pub != "取得不可": with_time += 1
@@ -307,7 +306,6 @@ def get_msn_news(keyword: str):
     driver.quit()
 
     data, with_time = [], 0
-
     cards = soup.select("div.news-card[data-title][data-url]") or []
     for c in cards:
         try:
@@ -364,35 +362,80 @@ def get_msn_news(keyword: str):
     return data
 
 # ====== Yahoo コメント数 ======
-def count_yahoo_comments_with_driver(driver, url: str, max_pages: int = 10, sleep_sec: float = 2.0) -> int:
+YAHOO_COMMENT_TEXT_RE = re.compile(r"コメント[（(]\s*([0-9,]+)\s*[)）]")
+
+def extract_total_comment_count_from_html(html: str) -> int | None:
+    """記事本文 or コメント1ページ目のHTMLから「コメント（1,234）」を正規表現で抽出"""
+    if not html:
+        return None
+    # まずタイトル近辺やボタン類に「コメント（N）」があるはずなのでテキスト全体から探す
+    text = BeautifulSoup(html, "html.parser").get_text(" ", strip=True)
+    m = YAHOO_COMMENT_TEXT_RE.search(text)
+    if m:
+        try:
+            return int(m.group(1).replace(",", ""))
+        except Exception:
+            return None
+    return None
+
+def count_yahoo_comments_with_driver(driver, url: str, max_pages: int = 25, sleep_sec: float = 1.5) -> int:
     """
-    Yahooニュース記事に対し /comments?page=N を開いて <p class='sc-169yn8p-10'> を数える方式。
-    参照いただいたスクリプトのロジックを簡略化してカウント専用にしています。
+    1) まず総数表記（コメント（N））を拾う（最速・正確）
+    2) 取れない場合のみ、/comments?page=N をめくって数える（重複耐性あり）
     """
-    total = 0
-    prev_first = None
+    # 1) 記事ページから総数取得（多くのケースでこれが入る）
+    try:
+        driver.get(url)
+        time.sleep(sleep_sec)
+        html0 = driver.page_source
+        total = extract_total_comment_count_from_html(html0)
+        if isinstance(total, int):
+            return total
+    except Exception:
+        pass
+
+    # 2) コメントページ（page=1）から総数取得を試みる
+    try:
+        c1 = f"{url.rstrip('/')}/comments?page=1"
+        driver.get(c1)
+        time.sleep(sleep_sec)
+        html1 = driver.page_source
+        total = extract_total_comment_count_from_html(html1)
+        if isinstance(total, int):
+            return total
+    except Exception:
+        pass
+
+    # 3) フォールバック：ページ送りでカウント（前版よりも重複検出を厳密に）
+    seen_first_hash = None
+    accumulated = 0
     for page in range(1, max_pages + 1):
         c_url = f"{url.rstrip('/')}/comments?page={page}"
         try:
             driver.get(c_url)
             time.sleep(sleep_sec)
             soup = BeautifulSoup(driver.page_source, "html.parser")
-            elems = soup.find_all("p", class_="sc-169yn8p-10")
-            if not elems:
+            # コメント本文タグ（将来クラス名が変わる可能性を考慮して候補を複数）
+            elems = soup.find_all("p", class_=re.compile(r"^sc-"))
+            # 文字数が短すぎるUIテキストを除外（ノイズ対策）
+            comments = [p.get_text(strip=True) for p in elems if p.get_text(strip=True) and len(p.get_text(strip=True)) >= 2]
+            if not comments:
                 break
-            first_text = elems[0].get_text(strip=True) if elems else None
-            # 同じ内容がループし始めたら終了
-            if prev_first and first_text == prev_first:
+            # 1ページ目の最初のコメントのハッシュを基準に重複検出
+            first_hash = hash(comments[0])
+            if seen_first_hash is None:
+                seen_first_hash = first_hash
+            elif first_hash == seen_first_hash:
+                # 同じ並びを再表示していると判断
                 break
-            prev_first = first_text
-            total += len(elems)
+            accumulated += len(comments)
         except Exception:
             break
-    return total
+    return accumulated
 
-def get_yahoo_comment_counts(urls: list, sleep_sec: float = 2.0) -> dict:
+def get_yahoo_comment_counts(urls: list, sleep_sec: float = 1.5) -> dict:
     """
-    複数URLを1つのドライバで順にカウントして、{url: count} を返す
+    複数URLを1つのドライバで順に処理し、{url: count} を返す
     """
     if not urls:
         return {}
@@ -444,7 +487,7 @@ def build_daily_sheet(sh, rows_all: list):
             if src in filtered:
                 filtered[src].append(r)
 
-    print(f"📊 フィルタ結果: MSN={len(filtered['MSN'])}, Google={len(filtered['Google'])}, Yahoo={len(filtered['Yahoo'])}, 日付無しスキップ={no_date}")
+    print(f"📊 フィルタ結果: MSN={len(filtered['MSN'])}}, Google={len(filtered['Google'])}, Yahoo={len(filtered['Yahoo'])}, 日付無しスキップ={no_date}")
 
     def dedup_sort(lst):
         seen = set(); uniq = []
