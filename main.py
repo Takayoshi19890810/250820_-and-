@@ -1,16 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-ニュース集約スクリプト（まとめシートのみ出力）
-- MSN / Google / Yahoo からキーワード検索でニュース取得（Selenium）
-- Yahooはノイズ除外（/articles/ または /pickup/ のみ）し、記事ページから投稿日も補完
-- 日付ウィンドウ（前日15:00〜当日14:59 JST）で「YYMMDD」シートに集約
-- 集約シートは A列=ソース名、並びは MSN → Google → Yahoo（各ソース内は投稿日降順）
-
-環境変数:
-- GCP_SERVICE_ACCOUNT_KEY: サービスアカウントJSON文字列（GitHub Secrets 推奨）
-  （ローカルは credentials.json でも可）
-- NEWS_KEYWORD: 検索キーワード（デフォ: "日産"）
-- SPREADSHEET_ID: 出力先スプレッドシートID（デフォはご指定ID）
+まとめシートのみ出力 / 今日の YYMMDD に、昨日15:00〜今日14:59 の記事を集約
+- Google/MSN は参照コードのセレクタ・ロジックを優先採用（安定）
+- Yahoo は /articles/ or /pickup/ の記事のみ対象、記事ページから投稿日を補完
+- 並び順: MSN → Google → Yahoo（各ソース内は投稿日降順）
+- A列=ソース（MSN/Google/Yahoo）
 """
 
 import os
@@ -29,26 +23,21 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 
-
-# ========= 設定 =========
+# ====== 設定 ======
 KEYWORD = os.getenv("NEWS_KEYWORD", "日産")
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
-    "1Vs4Cx8QPN4H2NOgtwaviOCe8zBTpUNDgJjqkHr51IZE"
+    "1Vs4Cx8QPN4H2NOgtwaviOCe8zBTpUNDgJjqkHr51IZE"  # 正しい出力先
 )
 
-
-# ========= ユーティリティ =========
+# ====== 共通ユーティリティ ======
 def jst_now() -> datetime:
     return datetime.utcnow() + timedelta(hours=9)
-
 
 def fmt(dt: datetime) -> str:
     return dt.strftime("%Y/%m/%d %H:%M")
 
-
 def try_parse_jst(dt_str: str):
-    """代表的な日時文字列→datetime（JST）。失敗時は None"""
     if not dt_str or dt_str == "取得不可":
         return None
     patterns = [
@@ -56,8 +45,10 @@ def try_parse_jst(dt_str: str):
         "%Y/%m/%d %H:%M:%S",
         "%Y/%m/%d",
         "%Y-%m-%d %H:%M",
-        "%Y-%m-%dT%H:%M:%SZ",  # UTC → JST
-        "%Y-%m-%dT%H:%M:%S%z", # tz aware
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%Y-%m-%dT%H:%M:%S%z",
+        "%Y-%m-%dT%H:%M:%S.%fZ",
+        "%Y-%m-%dT%H:%M:%S.%f%z",
     ]
     for p in patterns:
         try:
@@ -65,31 +56,22 @@ def try_parse_jst(dt_str: str):
             if p.endswith("Z"):
                 dt = dt + timedelta(hours=9)
             elif "%z" in p:
-                # tz-aware → JSTへ
-                dt = dt.astimezone(tz=None)  # UTCローカル
+                dt = dt.astimezone(tz=None)
                 dt = dt + timedelta(hours=9)
             return dt
         except Exception:
             pass
     return None
 
-
 def parse_relative_time(label: str, base: datetime) -> str:
-    """
-    「◯分前 / ◯時間前 / ◯日前」「MM月DD日」「HH:MM」などを JST 絶対時刻に。
-    失敗時は "取得不可"
-    """
-    s = (label or "").strip()
+    s = (label or "").strip().lower()
     try:
-        m = re.search(r"(\d+)\s*分前", s)
-        if m:
-            return fmt(base - timedelta(minutes=int(m.group(1))))
-        h = re.search(r"(\d+)\s*時間前", s)
-        if h:
-            return fmt(base - timedelta(hours=int(h.group(1))))
-        d = re.search(r"(\d+)\s*日前", s)
-        if d:
-            return fmt(base - timedelta(days=int(d.group(1))))
+        m = re.search(r"(\d+)\s*分前|(\d+)\s*minute", s)
+        if m: return fmt(base - timedelta(minutes=int(m.group(1) or m.group(2) or 0)))
+        h = re.search(r"(\d+)\s*時間前|(\d+)\s*hour", s)
+        if h: return fmt(base - timedelta(hours=int(h.group(1) or h.group(2) or 0)))
+        d = re.search(r"(\d+)\s*日前|(\d+)\s*day", s)
+        if d: return fmt(base - timedelta(days=int(d.group(1) or d.group(2) or 0)))
         if re.match(r"\d{1,2}月\d{1,2}日$", s):
             dt = datetime.strptime(f"{base.year}年{s}", "%Y年%m月%d日")
             return fmt(dt)
@@ -106,15 +88,13 @@ def parse_relative_time(label: str, base: datetime) -> str:
         pass
     return "取得不可"
 
-
 def get_last_modified_datetime(url: str) -> str:
-    """HTTPヘッダ Last-Modified → JST（最終手段）"""
     try:
         r = requests.head(url, timeout=6, allow_redirects=True)
         if "Last-Modified" in r.headers:
             dt = parsedate_to_datetime(r.headers["Last-Modified"])
             if dt.tzinfo:
-                dt = dt.astimezone(tz=None)  # UTCローカル
+                dt = dt.astimezone(tz=None)
                 dt = dt + timedelta(hours=9)
             else:
                 dt = dt + timedelta(hours=9)
@@ -122,7 +102,6 @@ def get_last_modified_datetime(url: str) -> str:
     except Exception:
         pass
     return "取得不可"
-
 
 def fetch_html(url: str, timeout: int = 10):
     try:
@@ -134,176 +113,228 @@ def fetch_html(url: str, timeout: int = 10):
         pass
     return ""
 
-
-def extract_yahoo_article_datetime(html: str) -> str:
-    """Yahoo記事ページから投稿日を推定（複数候補を順にチェック）"""
-    if not html:
-        return "取得不可"
+def extract_datetime_from_article(html: str) -> str:
+    """JSON-LD / <time datetime> / OGメタから日時を拾ってJST文字列に"""
+    if not html: return "取得不可"
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1) <time datetime="...">
+    # JSON-LD
+    for tag in soup.find_all("script", {"type": "application/ld+json"}):
+        try:
+            data = json.loads(tag.string or "{}")
+            objs = data if isinstance(data, list) else [data]
+            for obj in objs:
+                if not isinstance(obj, dict): continue
+                for key in ["datePublished", "dateModified", "uploadDate"]:
+                    if obj.get(key):
+                        dt = try_parse_jst(str(obj[key]).strip())
+                        if dt: return fmt(dt)
+        except Exception:
+            continue
+
+    # <time datetime>
     t = soup.find("time", attrs={"datetime": True})
     if t and t.get("datetime"):
-        cand = t["datetime"].strip()
-        # 例: 2025-08-20T09:00:00+09:00 / 2025-08-20T00:00:00Z
-        dt = try_parse_jst(cand)
-        if dt:
-            return fmt(dt)
+        dt = try_parse_jst(t["datetime"].strip())
+        if dt: return fmt(dt)
 
-    # 2) meta[property=article:published_time] / article:modified_time / og:updated_time
+    # OG系
     for prop in ["article:published_time", "article:modified_time", "og:updated_time"]:
         m = soup.find("meta", attrs={"property": prop, "content": True})
         if m and m.get("content"):
             dt = try_parse_jst(m["content"].strip())
-            if dt:
-                return fmt(dt)
+            if dt: return fmt(dt)
 
     return "取得不可"
 
-
 def chrome_driver():
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--window-size=1920,1080")
-    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    opt = Options()
+    opt.add_argument("--headless=new")
+    opt.add_argument("--disable-gpu")
+    opt.add_argument("--no-sandbox")
+    opt.add_argument("--disable-dev-shm-usage")
+    opt.add_argument("--window-size=1920,1080")
+    opt.add_argument("--lang=ja-JP")
+    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opt)
 
-
-# ========= スクレイパ =========
+# ====== 取得：Google ======
 def get_google_news(keyword: str):
+    """
+    まず参照コードのセレクタで取得（a.JtKRv / time.hvbAAd / div.vr1PYe）
+    取れない場合に備えてフォールバックセレクタも併用
+    """
     driver = chrome_driver()
     url = f"https://news.google.com/search?q={keyword}&hl=ja&gl=JP&ceid=JP:ja"
     driver.get(url)
-    time.sleep(4)
+    time.sleep(5)
     for _ in range(3):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(1.4)
-
+        time.sleep(1.6)
     soup = BeautifulSoup(driver.page_source, "html.parser")
     driver.quit()
 
-    data = []
+    data, with_time = [], 0
+
+    # 参照コード準拠の取り方
     for art in soup.find_all("article"):
         try:
-            a = art.select_one("a.JtKRv, a.WwrzSb")
-            t = art.select_one("time[datetime]")
-            src = art.select_one("div.vr1PYe, div.SVJrMe")
-            if not a or not t:
+            a_tag   = art.select_one("a.JtKRv") or art.select_one("a.WwrzSb") or art.select_one("a.DY5T1d") or art.select_one("h3 a")
+            time_el = art.select_one("time.hvbAAd") or art.select_one("time[datetime]") or art.find("time")
+            source_el = art.select_one("div.vr1PYe") or art.select_one("div.SVJrMe")
+            if not a_tag: 
                 continue
-            title = a.get_text(strip=True)
-            href = a.get("href")
-            url = "https://news.google.com" + href[1:] if href and href.startswith("./") else href
-            dt = datetime.strptime(t.get("datetime"), "%Y-%m-%dT%H:%M:%SZ") + timedelta(hours=9)
-            pub = fmt(dt)
-            source = src.get_text(strip=True) if src else "Google"
-            if title and url and url.startswith("http"):
-                data.append({"タイトル": title, "URL": url, "投稿日": pub, "引用元": source, "ソース": "Google"})
+            title = a_tag.get_text(strip=True)
+            href  = a_tag.get("href")
+            if not title or not href:
+                continue
+            url = "https://news.google.com" + href[1:] if href.startswith("./") else href
+            if not url.startswith("http"):
+                continue
+
+            pub = "取得不可"
+            if time_el and time_el.get("datetime"):
+                dt = try_parse_jst(time_el.get("datetime").strip())
+                if dt: 
+                    pub = fmt(dt); with_time += 1
+            if pub == "取得不可":
+                html = fetch_html(url)
+                pub = extract_datetime_from_article(html)
+
+            source = (source_el.get_text(strip=True) if source_el else "Google") or "Google"
+            data.append({"タイトル": title, "URL": url, "投稿日": pub, "引用元": source, "ソース": "Google"})
         except Exception:
             continue
-    print(f"✅ Googleニュース: {len(data)} 件")
+
+    print(f"✅ Googleニュース: {len(data)} 件（投稿日取得 {with_time} 件）")
     return data
 
-
+# ====== 取得：Yahoo ======
 def get_yahoo_news(keyword: str):
     driver = chrome_driver()
     url = f"https://news.yahoo.co.jp/search?p={keyword}&ei=utf-8&categories=domestic,world,business,it,science,life,local"
     driver.get(url)
-    time.sleep(4)
-
+    time.sleep(5)
     soup = BeautifulSoup(driver.page_source, "html.parser")
     driver.quit()
 
-    data = []
-    # ノイズ除外のため、記事URLのみ採用
     def is_article(u: str) -> bool:
-        if not u or not u.startswith("http"):
-            return False
-        return ("news.yahoo.co.jp/articles/" in u) or ("news.yahoo.co.jp/pickup/" in u)
+        return u and u.startswith("http") and ("news.yahoo.co.jp/articles/" in u or "news.yahoo.co.jp/pickup/" in u)
 
-    # 広めに a[href] を拾い、記事URLのみ残す
-    for a in soup.find_all("a", href=True):
+    raw_links = [a.get("href") for a in soup.find_all("a", href=True)]
+    article_links = [u for u in raw_links if is_article(u)]
+
+    data, with_time = [], 0
+    seen = set()
+    for href in article_links:
+        if href in seen: continue
+        seen.add(href)
         try:
-            href = a["href"]
-            if not is_article(href):
+            html = fetch_html(href)
+            if not html:
                 continue
-            title = a.get_text(strip=True)
+            soup2 = BeautifulSoup(html, "html.parser")
+
+            # タイトル
+            title = ""
+            h1 = soup2.find("h1")
+            if h1: title = h1.get_text(strip=True)
+            if not title:
+                ogt = soup2.find("meta", attrs={"property": "og:title", "content": True})
+                if ogt: title = ogt["content"].strip()
             if not title or len(title) < 6:
-                # サムネ/カテゴリ等の短いテキストを弾く
                 continue
 
-            # 可能なら記事ページから日時補完
-            html = fetch_html(href)
-            pub = extract_yahoo_article_datetime(html)
-            # 出典（media名）も拾えたら載せる（無ければ "Yahoo"）
+            # 日付
+            pub = extract_datetime_from_article(html)
+            if pub != "取得不可": with_time += 1
+
+            # 出典
             source = "Yahoo"
-            if html:
-                soup2 = BeautifulSoup(html, "html.parser")
-                m = soup2.find("meta", attrs={"name": "source", "content": True})
-                if m and m.get("content"):
-                    source = m["content"].strip() or "Yahoo"
-                # 代替で、記事ヘッダ付近の媒体名っぽい要素を拾う簡易ロジック
-                if source == "Yahoo":
-                    cand = soup2.find(["span","div"], string=re.compile(r".+"))
-                    if cand:
-                        txt = cand.get_text(strip=True)
-                        if 2 <= len(txt) <= 20 and not txt.isdigit():
-                            source = txt
+            src_meta = soup2.find("meta", attrs={"name": "source", "content": True})
+            if src_meta and src_meta.get("content"):
+                source = src_meta["content"].strip() or "Yahoo"
 
             data.append({"タイトル": title, "URL": href, "投稿日": pub, "引用元": source, "ソース": "Yahoo"})
         except Exception:
             continue
 
-    # 重複URL除去
-    uniq = []
-    seen = set()
-    for d in data:
-        if d["URL"] not in seen:
-            seen.add(d["URL"])
-            uniq.append(d)
+    print(f"✅ Yahoo!ニュース（記事のみ）: {len(data)} 件（投稿日取得 {with_time} 件）")
+    return data
 
-    print(f"✅ Yahoo!ニュース（記事のみ）: {len(uniq)} 件")
-    return uniq
-
-
+# ====== 取得：MSN（Bing News） ======
 def get_msn_news(keyword: str):
+    """
+    参照コードの data-* 属性付き 'div.news-card' を優先
+    無い場合は見出しリンクからフォールバック
+    """
     base = jst_now()
     driver = chrome_driver()
     url = f"https://www.bing.com/news/search?q={keyword}&qft=sortbydate%3d'1'&form=YFNR"
     driver.get(url)
-    time.sleep(4)
-
+    time.sleep(5)
     soup = BeautifulSoup(driver.page_source, "html.parser")
     driver.quit()
 
-    data = []
-    cards = soup.select("div.news-card, news-card")
-    for c in cards:
+    data, with_time = [], 0
+
+    # 優先：参照コードのカード
+    cards = soup.select("div.news-card") or []
+    for card in cards:
         try:
-            title = (c.get("data-title") or "").strip()
-            link = (c.get("data-url") or "").strip()
-            author = (c.get("data-author") or "").strip()
+            title  = (card.get("data-title") or "").strip()
+            link   = (card.get("data-url") or "").strip()
+            source = (card.get("data-author") or "").strip() or "MSN"
             if not title or not link or not link.startswith("http"):
                 continue
 
             pub_label = ""
-            span = c.find("span", attrs={"aria-label": True})
-            if span and span.has_attr("aria-label"):
-                pub_label = span["aria-label"].strip()
+            pub_tag = card.find("span", attrs={"aria-label": True})
+            if pub_tag and pub_tag.has_attr("aria-label"):
+                pub_label = pub_tag["aria-label"].strip().lower()
 
             pub = parse_relative_time(pub_label, base)
-            if pub == "取得不可":
-                pub = get_last_modified_datetime(link)
+            if pub != "取得不可":
+                with_time += 1
+            else:
+                html = fetch_html(link)
+                pub = extract_datetime_from_article(html)
+                if pub == "取得不可":
+                    pub = get_last_modified_datetime(link)
 
-            data.append({"タイトル": title, "URL": link, "投稿日": pub, "引用元": author or "MSN", "ソース": "MSN"})
+            data.append({"タイトル": title, "URL": link, "投稿日": pub, "引用元": source, "ソース": "MSN"})
         except Exception:
             continue
 
-    print(f"✅ MSNニュース: {len(data)} 件")
+    # フォールバック：一般的なリンク構造
+    if not data:
+        for a in soup.select("a.title, h2 a, h3 a"):
+            try:
+                href = a.get("href")
+                title = a.get_text(strip=True)
+                if not href or not href.startswith("http") or not title:
+                    continue
+                # 近傍の相対時間
+                container = a.find_parent(["div","li","article"]) or soup
+                lab = ""
+                tspan = container.find("span", attrs={"aria-label": True})
+                if tspan and tspan.has_attr("aria-label"):
+                    lab = tspan["aria-label"].strip()
+                pub = parse_relative_time(lab, base)
+                if pub == "取得不可":
+                    html = fetch_html(href)
+                    pub = extract_datetime_from_article(html)
+                    if pub == "取得不可":
+                        pub = get_last_modified_datetime(href)
+                else:
+                    with_time += 1
+                data.append({"タイトル": title, "URL": href, "投稿日": pub, "引用元": "MSN", "ソース": "MSN"})
+            except Exception:
+                continue
+
+    print(f"✅ MSNニュース: {len(data)} 件（投稿日取得/推定 {with_time} 件）")
     return data
 
-
-# ========= スプレッドシート =========
+# ====== スプレッドシート ======
 def get_gspread_client():
     key = os.environ.get("GCP_SERVICE_ACCOUNT_KEY")
     if key:
@@ -314,59 +345,50 @@ def get_gspread_client():
             raise RuntimeError(f"GCP_SERVICE_ACCOUNT_KEY のJSONが不正です: {e}")
     return gspread.service_account(filename="credentials.json")
 
-
 def compute_window(now_jst: datetime):
     """
-    実行が 15:00 以降:   昨日15:00〜今日14:59:59 / シート名=今日のYYMMDD
-    実行が 15:00 より前: 一昨日15:00〜昨日14:59:59 / シート名=昨日のYYMMDD
+    いつ実行しても「昨日15:00〜今日14:59」が対象
+    シート名は「今日のYYMMDD」に固定
     """
     today = now_jst.date()
-    fifteen = datetime.combine(today, dtime(hour=15, minute=0))
-    if now_jst >= fifteen:
-        start = fifteen - timedelta(days=1)
-        end = fifteen - timedelta(seconds=1)
-        label = today.strftime("%y%m%d")
-    else:
-        start = fifteen - timedelta(days=2)
-        end = fifteen - timedelta(days=1, seconds=1)
-        label = (today - timedelta(days=1)).strftime("%y%m%d")
+    today_1500 = datetime.combine(today, dtime(hour=15, minute=0))
+    start = today_1500 - timedelta(days=1)        # 昨日 15:00
+    end   = today_1500 - timedelta(seconds=1)     # 今日 14:59:59
+    label = today.strftime("%y%m%d")              # 今日 → YYMMDD
     return start, end, label
 
-
 def build_daily_sheet(sh, rows_all: list):
-    """
-    rows_all: [ {"ソース","URL","タイトル","投稿日","引用元"} ... ]
-    並び: MSN → Google → Yahoo（各ソース内は投稿日降順）
-    """
     now = jst_now()
     start, end, label = compute_window(now)
     print(f"🕒 集約期間: {fmt(start)} 〜 {fmt(end)} → シート名: {label}")
 
-    # ウィンドウ内のみに絞る
-    filtered_by_src = {"MSN": [], "Google": [], "Yahoo": []}
+    filtered = {"MSN": [], "Google": [], "Yahoo": []}
+    no_date = 0
     for r in rows_all:
         dt = try_parse_jst(r.get("投稿日", ""))
-        if dt and (start <= dt <= end):
-            src = r.get("ソース", "")
-            if src in filtered_by_src:
-                filtered_by_src[src].append(r)
+        if not dt:
+            no_date += 1
+            continue
+        if start <= dt <= end:
+            src = r.get("ソース","")
+            if src in filtered:
+                filtered[src].append(r)
 
-    # ソース内URL去重 & 投稿日降順
+    print(f"📊 フィルタ結果: MSN={len(filtered['MSN'])}, Google={len(filtered['Google'])}, Yahoo={len(filtered['Yahoo'])}, 日付無しスキップ={no_date}")
+
     def dedup_sort(lst):
         seen = set()
         uniq = []
         for d in lst:
             if d["URL"] not in seen:
-                seen.add(d["URL"])
-                uniq.append(d)
+                seen.add(d["URL"]); uniq.append(d)
         uniq.sort(key=lambda x: try_parse_jst(x["投稿日"]) or datetime(1970,1,1), reverse=True)
         return uniq
 
     ordered = []
     for src in ["MSN", "Google", "Yahoo"]:
-        ordered.extend(dedup_sort(filtered_by_src[src]))
+        ordered.extend(dedup_sort(filtered[src]))
 
-    # 出力
     headers = ["ソース", "URL", "タイトル", "投稿日", "引用元"]
     try:
         ws = sh.worksheet(label)
@@ -383,11 +405,10 @@ def build_daily_sheet(sh, rows_all: list):
     else:
         print(f"⚠️ 集約シート {label}: 対象記事なし")
 
-
-# ========= メイン =========
+# ====== メイン ======
 def main():
     print(f"🔎 キーワード: {KEYWORD}")
-    print(f"📄 SPREADSHEET_ID(env優先): {SPREADSHEET_ID}")
+    print(f"📄 SPREADSHEET_ID: {SPREADSHEET_ID}")
 
     gc = get_gspread_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
@@ -398,15 +419,14 @@ def main():
     yahoo_items  = get_yahoo_news(KEYWORD)
     msn_items    = get_msn_news(KEYWORD)
 
-    # まとめシート用に結合（個別シートへの書き込みはしない）
+    # まとめだけ出力
     all_items = []
     all_items.extend(msn_items)
     all_items.extend(google_items)
     all_items.extend(yahoo_items)
 
-    print("\n--- 集約（まとめシートのみ出力: MSN→Google→Yahoo / A列=ソース） ---")
+    print("\n--- 集約（まとめシートのみ / A列=ソース / 順=MSN→Google→Yahoo） ---")
     build_daily_sheet(sh, all_items)
-
 
 if __name__ == "__main__":
     main()
