@@ -7,6 +7,7 @@ import random
 import traceback
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from urllib.parse import quote
 
 import requests
 from bs4 import BeautifulSoup
@@ -16,7 +17,13 @@ from google.oauth2.service_account import Credentials
 
 # ========= 基本設定 =========
 JST = timezone(timedelta(hours=9))
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120 Safari/537.36"}
+UA = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
 
 KEYWORD = os.getenv("KEYWORD", os.getenv("NEWS_KEYWORD", "日産")).strip()
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
@@ -25,9 +32,9 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
 USE_WDM = int(os.getenv("USE_WDM", "0"))   # 0: Selenium Manager, 1: webdriver-manager
 SCROLL_SLEEP = float(os.getenv("SCROLL_SLEEP", "1.2"))
-SCROLLS_GOOGLE = int(os.getenv("SCROLLS_GOOGLE", "4"))
-SCROLLS_YAHOO = int(os.getenv("SCROLLS_YAHOO", "4"))
-ALLOW_PICKUP_FALLBACK = int(os.getenv("ALLOW_PICKUP_FALLBACK", "1"))
+SCROLLS_GOOGLE = int(os.getenv("SCROLLS_GOOGLE", "5"))
+SCROLLS_YAHOO  = int(os.getenv("SCROLLS_YAHOO", "5"))
+ALLOW_PICKUP_FALLBACK = int(os.getenv("ALLOW_PICKUP_FALLBACK", "1"))  # trueならpickup単体でも拾う
 
 # ========= 共通ヘルパ =========
 def soup(html: str):
@@ -62,7 +69,7 @@ def fetch_html(url: str, timeout=15) -> str:
 def compute_window_and_sheet_name(now: datetime):
     today = now.astimezone(JST).date()
     start = datetime.combine(today - timedelta(days=1), datetime.min.time()).replace(tzinfo=JST) + timedelta(hours=15)
-    end = datetime.combine(today, datetime.min.time()).replace(tzinfo=JST) + timedelta(hours=14, minutes=59, seconds=59)
+    end   = datetime.combine(today, datetime.min.time()).replace(tzinfo=JST) + timedelta(hours=14, minutes=59, seconds=59)
     sheet_name = now.astimezone(JST).strftime("%y%m%d")
     return start, end, sheet_name
 
@@ -107,23 +114,53 @@ def fetch_msn(keyword: str):
     items = []
     try:
         driver = get_driver()
-        url = f"https://www.bing.com/news/search?q={keyword}&qft=sortbydate%3d'1'&form=YFNR"
+        q = quote(keyword)
+        url = f"https://www.bing.com/news/search?q={q}&qft=sortbydate%3d'1'&form=YFNR"
         driver.get(url)
         time.sleep(3)
-        smooth_scroll(driver, times=2, sleep=SCROLL_SLEEP)
+        smooth_scroll(driver, times=3, sleep=SCROLL_SLEEP)
         sp = soup(driver.page_source)
         driver.quit()
+
         cards = sp.select("div.news-card")
+        now = datetime.now(JST)
         for c in cards:
             title = c.get("data-title", "").strip()
-            url = c.get("data-url", "").strip()
+            url   = c.get("data-url", "").strip()
             source = c.get("data-author", "").strip() or "MSN"
-            pub = parse_last_modified(url) if url else ""
+
+            # 相対時刻の aria-label があるケースの取り扱い（なければ後でHEAD）
+            label = ""
+            span = c.find("span", attrs={"aria-label": True})
+            if span and span.has_attr("aria-label"):
+                label = span["aria-label"].strip().lower()
+
+            pub = ""
+            if label:
+                pub = _parse_relative_label(label, now)
+            if (not pub) and url:
+                pub = parse_last_modified(url)
+
             if title and url and pub:
                 items.append(("MSN", url, title, pub, source))
     except Exception:
         traceback.print_exc()
     return items
+
+def _parse_relative_label(label: str, base: datetime) -> str:
+    try:
+        if "分" in label or "min" in label:
+            m = re.search(r"(\d+)", label)
+            if m: return fmt_jst(base - timedelta(minutes=int(m.group(1))))
+        if "時間" in label or "hour" in label:
+            m = re.search(r"(\d+)", label)
+            if m: return fmt_jst(base - timedelta(hours=int(m.group(1))))
+        if "日" in label or "day" in label:
+            m = re.search(r"(\d+)", label)
+            if m: return fmt_jst(base - timedelta(days=int(m.group(1))))
+    except Exception:
+        pass
+    return ""
 
 # ========= Google =========
 def fetch_google(keyword: str):
@@ -131,27 +168,62 @@ def fetch_google(keyword: str):
     driver = None
     try:
         driver = get_driver()
-        url = f"https://news.google.com/search?q={keyword}&hl=ja&gl=JP&ceid=JP:ja"
+        q = quote(keyword)
+        url = f"https://news.google.com/search?q={q}&hl=ja&gl=JP&ceid=JP:ja"
         driver.get(url)
         time.sleep(3)
         smooth_scroll(driver, times=SCROLLS_GOOGLE, sleep=SCROLL_SLEEP)
         sp = soup(driver.page_source)
         driver.quit()
+
         seen = set()
-        for a in sp.find_all("a", href=True):
+        # Google News 構造：<article> 内に <time datetime> あり
+        for art in sp.find_all("article"):
+            a = art.find("a", href=True)
+            if not a:
+                continue
             href = a["href"]
             if "/articles/" not in href:
                 continue
-            full = "https://news.google.com" + href[1:] if href.startswith("./") else ("https://news.google.com"+href if href.startswith("/") else href)
+            if href.startswith("./"):
+                full = "https://news.google.com" + href[1:]
+            elif href.startswith("/"):
+                full = "https://news.google.com" + href
+            else:
+                full = href
             title = a.get_text(strip=True)
+
+            pub = ""
+            t = art.find("time")
+            if t and t.has_attr("datetime"):
+                try:
+                    dt = datetime.fromisoformat(t["datetime"].replace("Z", "+00:00")).astimezone(JST)
+                    pub = fmt_jst(dt)
+                except Exception:
+                    pass
+
+            # 最終URL解決（pubが無い場合でもやる）
             try:
-                final = requests.get(full, headers=UA, timeout=10, allow_redirects=True).url
+                r = requests.get(full, headers=UA, timeout=10, allow_redirects=True)
+                final = r.url
             except Exception:
                 final = full
-            pub = parse_last_modified(final)
-            if final not in seen and title and pub:
-                seen.add(final)
-                items.append(("Google", final, title, pub, ""))
+
+            if not pub:
+                pub = parse_last_modified(final)
+
+            source = ""
+            src_div = art.find("div", class_=re.compile("vr1PYe"))
+            if src_div:
+                source = src_div.get_text(strip=True)
+
+            if final in seen:
+                continue
+            seen.add(final)
+
+            if title and final and pub:
+                items.append(("Google", final, title, pub, source or ""))
+            time.sleep(0.05)
     except Exception:
         traceback.print_exc()
     finally:
@@ -166,15 +238,17 @@ def fetch_yahoo(keyword: str):
     driver = None
     try:
         driver = get_driver()
+        q = quote(keyword)
         url = (
             "https://news.yahoo.co.jp/search"
-            f"?p={keyword}&ei=utf-8&categories=domestic,world,business,it,science,life,local"
+            f"?p={q}&ei=utf-8&categories=domestic,world,business,it,science,life,local"
         )
         driver.get(url)
         time.sleep(3)
         smooth_scroll(driver, times=SCROLLS_YAHOO, sleep=SCROLL_SLEEP)
         sp = soup(driver.page_source)
         driver.quit()
+
         cand = []
         for a in sp.find_all("a", href=True):
             href = a["href"]
@@ -185,17 +259,26 @@ def fetch_yahoo(keyword: str):
                     href = "https://news.yahoo.co.jp" + href
             if "news.yahoo.co.jp/articles/" in href or "news.yahoo.co.jp/pickup/" in href:
                 cand.append(href)
+
         seen = set()
         for u in cand:
-            if u in seen: continue
+            if u in seen: 
+                continue
             seen.add(u)
-            html = fetch_html(u)
-            sp1 = soup(html)
-            h1 = sp1.find("h1")
-            title = h1.get_text(strip=True) if h1 else ""
-            pub = parse_last_modified(u)
-            if (title or (ALLOW_PICKUP_FALLBACK and u)) and pub:
-                items.append(("Yahoo", u, title or "", pub, ""))
+
+            html0 = fetch_html(u)
+            art_url = _resolve_yahoo_article_url(html0, u)
+
+            html1 = html0 if art_url == u else fetch_html(art_url)
+            title = _extract_yahoo_title(html1) if html1 else ""
+            pub = _extract_yahoo_datetime(html1) if html1 else ""
+            if not pub and art_url:
+                pub = parse_last_modified(art_url)
+
+            final = art_url or u
+            if (title or (ALLOW_PICKUP_FALLBACK and final)) and pub:
+                items.append(("Yahoo", final, title or "", pub, ""))
+            time.sleep(0.08)
     except Exception:
         traceback.print_exc()
     finally:
@@ -203,6 +286,59 @@ def fetch_yahoo(keyword: str):
             try: driver.quit()
             except: pass
     return items
+
+def _resolve_yahoo_article_url(html: str, url: str) -> str:
+    try:
+        sp = soup(html)
+        og = sp.find("meta", attrs={"property": "og:url", "content": True})
+        if og and og["content"].startswith("http"):
+            return og["content"]
+        link = sp.find("link", attrs={"rel": "canonical", "href": True})
+        if link and link["href"].startswith("http"):
+            return link["href"]
+    except Exception:
+        pass
+    return url
+
+def _extract_yahoo_datetime(html: str) -> str:
+    sp = soup(html)
+    # itemprop
+    m = sp.find("meta", attrs={"itemprop": "datePublished", "content": True})
+    if m:
+        try:
+            dt = datetime.fromisoformat(m["content"].replace("Z", "+00:00")).astimezone(JST)
+            return fmt_jst(dt)
+        except Exception:
+            pass
+    # <time datetime>
+    t = sp.find("time")
+    if t and t.has_attr("datetime"):
+        try:
+            dt = datetime.fromisoformat(t["datetime"].replace("Z", "+00:00")).astimezone(JST)
+            return fmt_jst(dt)
+        except Exception:
+            pass
+    # テキスト（例: 2025/08/20 09:15）
+    if t and t.get_text(strip=True):
+        txt = re.sub(r"\([月火水木金土日]\)", "", t.get_text(strip=True))
+        try:
+            dt = datetime.strptime(txt, "%Y/%m/%d %H:%M").replace(tzinfo=JST)
+            return fmt_jst(dt)
+        except Exception:
+            pass
+    return ""
+
+def _extract_yahoo_title(html: str) -> str:
+    sp = soup(html)
+    h1 = sp.find("h1")
+    if h1:
+        t = h1.get_text(strip=True)
+        if t:
+            return t
+    og = sp.find("meta", attrs={"property": "og:title", "content": True})
+    if og and og["content"].strip():
+        return og["content"].strip()
+    return (sp.title.get_text(strip=True) if sp.title else "").strip()
 
 # ========= Gemini 分類（番号+タイトル→4列TSVで返させる） =========
 GEMINI_PROMPT = """あなたは敏腕雑誌記者です。 上記Webニュースのタイトルを以下の視点で判断してほしい。
@@ -241,7 +377,6 @@ def classify_with_gemini(titles):
     idx_offset = 0
     for i in range(0, len(titles), BATCH):
         chunk = titles[i:i+BATCH]
-        # 番号付きリストを作成（1始まり、バッチ内はオフセット加算）
         numbered = [f"{idx_offset+j+1}. {t}" for j, t in enumerate(chunk)]
         prompt = GEMINI_PROMPT + "\n番号付きタイトル一覧:\n" + "\n".join(numbered)
 
@@ -263,21 +398,14 @@ def classify_with_gemini(titles):
         for ln in lines:
             parts = [p.strip() for p in ln.split("\t")]
             if len(parts) >= 4:
-                # 期待: 番号, タイトル, 判定, カテゴリ
                 num_str, title_out, senti, cate = parts[0], parts[1], parts[2], parts[3]
-                m = re.match(r"^\d+$", num_str)
+                m = re.match(r"^(\d+)", num_str)
                 if not m:
-                    # "12. " などに来ても拾えるように
-                    m2 = re.match(r"^(\d+)\.?", num_str)
-                    if m2:
-                        num_str = m2.group(1)
-                    else:
-                        continue
-                idx = int(num_str)
+                    continue
+                idx = int(m.group(1))
                 results_by_idx[idx] = (senti, cate)
         idx_offset += len(chunk)
 
-    # 並びを元の順に復元（欠損はニュートラル/その他で埋める）
     results = []
     for i in range(1, len(titles)+1):
         results.append(results_by_idx.get(i, ("ニュートラル", "その他")))
@@ -294,7 +422,6 @@ def open_sheet(spreadsheet_id: str):
         data = json.loads(blob)
         creds = Credentials.from_service_account_info(data, scopes=["https://www.googleapis.com/auth/spreadsheets"])
     except Exception:
-        # 文字列がJSONでない場合はファイルとして書き出して読む
         path = "credentials.json"
         with open(path, "w", encoding="utf-8") as f:
             f.write(blob)
@@ -309,9 +436,10 @@ def upsert_single_sheet(sh, sheet_name: str, rows: list):
         ws.clear()
     except gspread.exceptions.WorksheetNotFound:
         ws = sh.add_worksheet(title=sheet_name, rows=str(max(1000, len(rows)+10)), cols=str(len(headers)))
-    ws.update("A1:G1", [headers])
+    # gspread の警告対策：values を先、range_name を後
+    ws.update(values=[headers], range_name="A1:G1")
     if rows:
-        ws.update(f"A2:G{len(rows)+1}", rows)
+        ws.update(values=rows, range_name=f"A2:G{len(rows)+1}")
 
 # ========= メイン =========
 def main():
@@ -321,16 +449,14 @@ def main():
     print(f"📅 期間: {fmt_jst(start)}〜{fmt_jst(end)} / シート: {sheet_name}")
 
     # 取得（順序: MSN → Google → Yahoo）
-    msn = fetch_msn(KEYWORD)
+    msn    = fetch_msn(KEYWORD)
     print(f"MSN raw: {len(msn)}")
-
     google = fetch_google(KEYWORD)
     print(f"Google raw: {len(google)}")
-
-    yahoo = fetch_yahoo(KEYWORD)
+    yahoo  = fetch_yahoo(KEYWORD)
     print(f"Yahoo raw: {len(yahoo)}")
 
-    # 結合（順序維持）＆ URL重複先勝ち（MSN優先）＆ ウィンドウ内のみ
+    # 結合（順序維持）＆ URL重複は先勝ち（MSN優先）＆ ウィンドウ内のみ
     merged = []
     seen = set()
     for row in (msn + google + yahoo):
@@ -345,17 +471,15 @@ def main():
     print(f"📦 フィルタ後: {len(merged)} 件")
 
     if not merged:
-        # 何も無い場合でもシートは作成（ヘッダのみ）
         sh = open_sheet(SPREADSHEET_ID)
         upsert_single_sheet(sh, sheet_name, [])
         print("⚠️ 期間内の記事が見つかりませんでした。")
         return
 
-    # 分類（番号+タイトルでAIに依頼）
+    # 分類（AI必須）
     titles = [t for (_, _, t, _, _) in merged]
     labels = classify_with_gemini(titles)  # [(sentiment, category)]
 
-    # 出力整形
     def norm_sent(s):
         s = s.strip()
         if s.startswith("ポジ"): return "ポジティブ"
