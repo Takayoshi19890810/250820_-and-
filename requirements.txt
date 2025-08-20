@@ -1,8 +1,0 @@
-requests
-beautifulsoup4
-lxml
-gspread
-google-auth
-google-generativeai
-selenium>=4.10
-webdriver-manager>=4.0.0
