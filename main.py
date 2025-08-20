@@ -1,7 +1,8 @@
 # -*- coding: utf-8 -*-
 """
 まとめシートのみ出力 / 今日の YYMMDD に、昨日15:00〜今日14:59 の記事を集約
-+ Geminiを「バッチ推論」で使用し、C列タイトルから G列(ポジ/ネガ/ニュートラル)・H列(カテゴリ) を一括付与
++ Gemini を「バッチ推論」で使用し、C列タイトル → G列(ポジ/ネガ/ニュートラル)・H列(カテゴリ) を一括付与
++ Yahoo 記事のコメント数を取得して F列に記載（/comments?page=N を Selenium で巡回して数える）
 """
 
 import os
@@ -106,6 +107,7 @@ def fetch_html(url: str, timeout: int = 10):
 def extract_datetime_from_article(html: str) -> str:
     if not html: return "取得不可"
     soup = BeautifulSoup(html, "html.parser")
+    # JSON-LD
     for tag in soup.find_all("script", {"type": "application/ld+json"}):
         try:
             data = json.loads(tag.string or "{}")
@@ -118,10 +120,12 @@ def extract_datetime_from_article(html: str) -> str:
                         if dt: return fmt(dt)
         except Exception:
             continue
+    # <time datetime>
     t = soup.find("time", attrs={"datetime": True})
     if t and t.get("datetime"):
         dt = try_parse_jst(t["datetime"].strip())
         if dt: return fmt(dt)
+    # OG
     for prop in ["article:published_time", "article:modified_time", "og:updated_time"]:
         m = soup.find("meta", attrs={"property": prop, "content": True})
         if m and m.get("content"):
@@ -133,6 +137,7 @@ def extract_title_and_source_from_yahoo(html: str):
     title, source = "", "Yahoo"
     if not html: return title, source
     soup = BeautifulSoup(html, "html.parser")
+    # JSON-LD
     for tag in soup.find_all("script", {"type": "application/ld+json"}):
         try:
             data = json.loads(tag.string or "{}")
@@ -147,6 +152,7 @@ def extract_title_and_source_from_yahoo(html: str):
                             source = str(pub["name"]).strip() or "Yahoo"
         except Exception:
             continue
+    # <h1> / twitter:title / og:title
     if not title:
         h1 = soup.find("h1")
         if h1: title = h1.get_text(strip=True)
@@ -158,6 +164,7 @@ def extract_title_and_source_from_yahoo(html: str):
         og = soup.find("meta", attrs={"property": "og:title", "content": True})
         if og and og["content"].strip() != "Yahoo!ニュース":
             title = og["content"].strip()
+    # 出典
     if source == "Yahoo":
         src_meta = soup.find("meta", attrs={"name": "source", "content": True})
         if src_meta and src_meta.get("content"):
@@ -190,6 +197,7 @@ def chrome_driver():
     opt.add_argument("--disable-dev-shm-usage")
     opt.add_argument("--window-size=1920,1080")
     opt.add_argument("--lang=ja-JP")
+    # ヘッドレス検知を弱める
     opt.add_argument("--disable-blink-features=AutomationControlled")
     opt.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -264,17 +272,22 @@ def get_yahoo_news(keyword: str):
         seen.add(href)
         try:
             html0 = fetch_html(href)
-            real_url = resolve_yahoo_article_url(html0, href)
+            real_url = resolve_yahoo_article_url(html0, href)  # pickup→記事へ解決
             html = fetch_html(real_url) if real_url != href else html0
             if not html: continue
+
             title, source = extract_title_and_source_from_yahoo(html)
             pub = extract_datetime_from_article(html)
+
+            # タイトル最低限ガード
             if not title or title == "Yahoo!ニュース":
                 continue
             if pub != "取得不可": with_time += 1
+
             data.append({"タイトル": title, "URL": real_url, "投稿日": pub, "引用元": source, "ソース": "Yahoo"})
         except Exception:
             continue
+
     print(f"✅ Yahoo!ニュース: {len(data)} 件（投稿日取得 {with_time} 件）")
     return data
 
@@ -294,6 +307,7 @@ def get_msn_news(keyword: str):
     driver.quit()
 
     data, with_time = [], 0
+
     cards = soup.select("div.news-card[data-title][data-url]") or []
     for c in cards:
         try:
@@ -349,6 +363,51 @@ def get_msn_news(keyword: str):
     print(f"✅ MSNニュース: {len(data)} 件（投稿日取得/推定 {with_time} 件）")
     return data
 
+# ====== Yahoo コメント数 ======
+def count_yahoo_comments_with_driver(driver, url: str, max_pages: int = 10, sleep_sec: float = 2.0) -> int:
+    """
+    Yahooニュース記事に対し /comments?page=N を開いて <p class='sc-169yn8p-10'> を数える方式。
+    参照いただいたスクリプトのロジックを簡略化してカウント専用にしています。
+    """
+    total = 0
+    prev_first = None
+    for page in range(1, max_pages + 1):
+        c_url = f"{url.rstrip('/')}/comments?page={page}"
+        try:
+            driver.get(c_url)
+            time.sleep(sleep_sec)
+            soup = BeautifulSoup(driver.page_source, "html.parser")
+            elems = soup.find_all("p", class_="sc-169yn8p-10")
+            if not elems:
+                break
+            first_text = elems[0].get_text(strip=True) if elems else None
+            # 同じ内容がループし始めたら終了
+            if prev_first and first_text == prev_first:
+                break
+            prev_first = first_text
+            total += len(elems)
+        except Exception:
+            break
+    return total
+
+def get_yahoo_comment_counts(urls: list, sleep_sec: float = 2.0) -> dict:
+    """
+    複数URLを1つのドライバで順にカウントして、{url: count} を返す
+    """
+    if not urls:
+        return {}
+    driver = chrome_driver()
+    out = {}
+    try:
+        for u in urls:
+            try:
+                out[u] = count_yahoo_comments_with_driver(driver, u, sleep_sec=sleep_sec)
+            except Exception:
+                out[u] = 0
+    finally:
+        driver.quit()
+    return out
+
 # ====== スプレッドシート ======
 def get_gspread_client():
     key = os.environ.get("GCP_SERVICE_ACCOUNT_KEY")
@@ -399,22 +458,32 @@ def build_daily_sheet(sh, rows_all: list):
     for src in ["MSN", "Google", "Yahoo"]:
         ordered.extend(dedup_sort(filtered[src]))
 
-    headers = ["ソース", "URL", "タイトル", "投稿日", "引用元"]  # A..E
+    # --- Yahooコメント数を一括取得 ---
+    yahoo_urls = [d["URL"] for d in ordered if d.get("ソース") == "Yahoo"]
+    cmt_map = get_yahoo_comment_counts(sorted(set(yahoo_urls))) if yahoo_urls else {}
+
+    # ヘッダー: A..F まで使用（G/H は Gemini 用）
+    headers = ["ソース", "URL", "タイトル", "投稿日", "引用元", "コメント数"]  # A..F
     try:
         ws = sh.worksheet(label)
         ws.clear(); ws.append_row(headers)
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=label, rows=str(max(2, len(ordered)+5)), cols="8")
+        ws = sh.add_worksheet(title=label, rows=str(max(2, len(ordered)+5)), cols="9")
         ws.append_row(headers)
 
     if ordered:
-        rows = [[d["ソース"], d["URL"], d["タイトル"], d["投稿日"], d["引用元"]] for d in ordered]
+        rows = []
+        for d in ordered:
+            cnt = ""
+            if d["ソース"] == "Yahoo":
+                cnt = cmt_map.get(d["URL"], 0)
+            rows.append([d["ソース"], d["URL"], d["タイトル"], d["投稿日"], d["引用元"], cnt])
         ws.append_rows(rows, value_input_option="USER_ENTERED")
-        print(f"✅ 集約シート {label}: {len(rows)} 件")
+        print(f"✅ 集約シート {label}: {len(rows)} 件（Yahooコメント数 付与: {len(yahoo_urls)} 件）")
     else:
         print(f"⚠️ 集約シート {label}: 対象記事なし")
 
-    # ← 修正ポイント：単セル更新ではなく二次元配列で一括更新
+    # G/H ヘッダー
     ws.update("G1:H1", [["ポジネガ", "カテゴリ"]])
 
     return label
@@ -479,6 +548,7 @@ def classify_titles_in_batches(sh, sheet_name: str, batch_size: int = 80, sleep_
         print("⚠️ タイトル列が見つかりません。")
         return
 
+    # 2行目以降の C列をまとめて判定
     items = []
     for idx, row in enumerate(values[1:], start=2):
         title = row[2] if len(row) > 2 else ""
@@ -495,7 +565,7 @@ def classify_titles_in_batches(sh, sheet_name: str, batch_size: int = 80, sleep_
         prompt = build_batch_prompt(batch)
         try:
             resp = model.generate_content(prompt)
-            text = (getattr(resp, "text", "") or "").strip()   # ← 修正: .trim() → .strip()
+            text = (getattr(resp, "text", "") or "").strip()
         except Exception as e:
             print(f"Geminiバッチ失敗: {e}")
             for r,_ in batch:
@@ -524,6 +594,7 @@ def classify_titles_in_batches(sh, sheet_name: str, batch_size: int = 80, sleep_
 
         time.sleep(sleep_sec)
 
+    # 一括書き込み（G/H）
     updates = []
     min_row = 2
     max_row = max(results_map.keys()) if results_map else 1
