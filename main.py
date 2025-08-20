@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-ニュース集約スクリプト
-- MSN / Google / Yahoo からキーワード検索でニュースを取得（Selenium）
-- 取得結果を各ソース専用シート（Google / Yahoo / MSN）へURL去重で追記
-- 日付ウィンドウ（前日15:00〜当日14:59 JST）で「YYMMDD」シートに集約
+ニュース集約スクリプト（Selenium 版）
+- MSN / Google / Yahoo からキーワード検索でニュース取得
+- 各ソース専用シート（Google / Yahoo / MSN）へ URL 去重で追記
+- 日付ウィンドウ（前日15:00〜当日14:59 JST）で「YYMMDD」シートへ集約
 - 集約シートは A列にソース名、並び順は MSN → Google → Yahoo（各ソース内は投稿日降順）
 
 環境変数:
@@ -57,7 +57,7 @@ def try_parse_jst(dt_str: str):
         "%Y/%m/%d %H:%M:%S",
         "%Y/%m/%d",
         "%Y-%m-%d %H:%M",
-        "%Y-%m-%dT%H:%M:%SZ",  # ZはUTC想定→JSTへ
+        "%Y-%m-%dT%H:%M:%SZ",  # Z はUTC想定→JSTへ
     ]
     for p in patterns:
         try:
@@ -90,7 +90,7 @@ def parse_relative_time(label: str, base: datetime) -> str:
         if d:
             return fmt(base - timedelta(days=int(d.group(1))))
         # 例) 8月20日 / 08月20日
-        if re.match(r"\d{1,2}月\d{1,2}日", s):
+        if re.match(r"\d{1,2}月\d{1,2}日$", s):
             dt = datetime.strptime(f"{base.year}年{s}", "%Y年%m月%d日")
             return fmt(dt)
         # 例) 2025/08/20
@@ -110,15 +110,16 @@ def parse_relative_time(label: str, base: datetime) -> str:
 
 
 def get_last_modified_datetime(url: str) -> str:
-    """ HEADのLast-ModifiedからJSTを推定（なければ取得不可） """
+    """ HEAD の Last-Modified から JST を推定（なければ取得不可） """
     try:
         r = requests.head(url, timeout=5, allow_redirects=True)
         if "Last-Modified" in r.headers:
             dt = parsedate_to_datetime(r.headers["Last-Modified"])
-            # tz-aware の場合はUTC基準、naiveは一応UTCとして+9h
+            # tz-aware はUTC基準、naive はUTCとして +9h
             if dt.tzinfo:
-                dt = dt.astimezone(tz=None)  # ローカルtz（GitHub ActionsはUTC）
-                dt = dt + timedelta(hours=9)  # JST
+                # Actions 環境はUTCなので+9hでJSTへ
+                dt = dt.astimezone(tz=None)  # ローカルtz（UTC）
+                dt = dt + timedelta(hours=9)
             else:
                 dt = dt + timedelta(hours=9)
             return fmt(dt)
@@ -139,14 +140,14 @@ def chrome_driver():
 # ========= スクレイパ =========
 def get_google_news(keyword: str):
     """
-    Googleニュース検索 (news.google.com) をSelenium+BS4で取得
+    Google ニュース検索 (news.google.com) を Selenium + BS4 で取得
     """
     driver = chrome_driver()
     url = f"https://news.google.com/search?q={keyword}&hl=ja&gl=JP&ceid=JP:ja"
     driver.get(url)
     time.sleep(4)
 
-    # スクロール数回
+    # スクロールで記事を増やす
     for _ in range(3):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
         time.sleep(1.5)
@@ -155,7 +156,6 @@ def get_google_news(keyword: str):
     driver.quit()
 
     data = []
-    # 記事カードはarticleタグ。クラスは揺れるため、セレクタは保守的に
     for art in soup.find_all("article"):
         try:
             a = art.select_one("a.JtKRv, a.WwrzSb")
@@ -180,7 +180,7 @@ def get_google_news(keyword: str):
 
 def get_yahoo_news(keyword: str):
     """
-    Yahoo!ニュース検索をSelenium+BS4で取得
+    Yahoo!ニュース検索を Selenium + BS4 で取得
     """
     driver = chrome_driver()
     url = f"https://news.yahoo.co.jp/search?p={keyword}&ei=utf-8&categories=domestic,world,business,it,science,life,local"
@@ -191,9 +191,8 @@ def get_yahoo_news(keyword: str):
     driver.quit()
 
     data = []
-    # リスト要素はクラスが頻繁に変わるため、ゆるめに抽出
-    articles = soup.find_all("li")
-    for li in articles:
+    # リスト要素はクラスが変わりやすいので、緩めに抽出
+    for li in soup.find_all("li"):
         try:
             a = li.find("a", href=True)
             if not a:
@@ -201,22 +200,17 @@ def get_yahoo_news(keyword: str):
             title = a.get_text(strip=True)
             url = a["href"]
 
-            # 投稿日表示（timeタグ等）
+            # 投稿日（time タグ等）
             time_tag = li.find("time")
             date_str = time_tag.get_text(strip=True) if time_tag else ""
-            # (火) 等の曜日カッコ消し
             date_str = re.sub(r"\([月火水木金土日]\)", "", date_str).strip()
             pub = "取得不可"
-            # 代表的な "YYYY/MM/DD HH:MM" に対応
             if re.match(r"\d{4}/\d{1,2}/\d{1,2}", date_str):
-                try:
-                    dt = try_parse_jst(date_str)
-                    if dt:
-                        pub = fmt(dt)
-                except Exception:
-                    pass
+                dt = try_parse_jst(date_str)
+                if dt:
+                    pub = fmt(dt)
 
-            # 出典（短いテキスト）を推測
+            # 出典を短いテキストから推定
             source = ""
             for tag in li.find_all(["span", "div"], string=True):
                 text = tag.get_text(strip=True)
@@ -237,7 +231,7 @@ def get_yahoo_news(keyword: str):
 
 def get_msn_news(keyword: str):
     """
-    MSN（Bingニュース検索）のカードをSelenium+BS4で取得
+    MSN（Bingニュース検索）のカードを Selenium + BS4 で取得
     """
     base = jst_now()
     driver = chrome_driver()
@@ -257,7 +251,7 @@ def get_msn_news(keyword: str):
             link = (c.get("data-url") or "").strip()
             author = (c.get("data-author") or "").strip()
 
-            # 相対時間（aria-label等）
+            # 相対時間（aria-label 等）
             pub_label = ""
             span = c.find("span", attrs={"aria-label": True})
             if span and span.has_attr("aria-label"):
@@ -296,7 +290,7 @@ def get_gspread_client():
 
 def append_to_source_sheet(sh, sheet_name: str, articles: list):
     """
-    各ソースシートへURL去重で追記
+    各ソースシートへ URL 去重で追記
     カラム: タイトル / URL / 投稿日 / 引用元
     """
     if not articles:
