@@ -1,15 +1,12 @@
 # -*- coding: utf-8 -*-
 """
 まとめシートのみ出力 / 今日の YYMMDD に、昨日15:00〜今日14:59 の記事を集約
-- MSN：news-card(data-*)を最優先、なければ見出しリンクにフォールバック
-        取得不可時は記事ページの JSON-LD / <time datetime> / OG で日時補完
-        ヘッドレス検知回避＆日本向けテンプレに寄せる（UA, setlang/mkt/cc, スクロール）
-- Yahoo：/articles/ /pickup/ のみ対象。pickup は実体記事URLへ解決してから
-         タイトル=JSON-LD headline優先→<h1>→twitter:title/og:title（"Yahoo!ニュース"は除外）
-         引用元=JSON-LD publisher.name→meta[name="source"]→本文近傍候補
-- Google：従来通り。time[datetime]→記事ページ補完
-- 出力はまとめシートのみ（列: ソース, URL, タイトル, 投稿日, 引用元）
-- 並び順: MSN → Google → Yahoo（各ソース内は投稿日降順）
++ Geminiを「バッチ推論」で使用し、C列タイトルから G列(ポジ/ネガ/ニュートラル)・H列(カテゴリ) を一括付与
+  - 無料枠節約のため、複数タイトルをまとめて 1 回の generate で処理
+  - 行番号(id)を付けてプロンプト → JSON配列で受け取り → 行ごとに書き込み
+
+出力列: [A:ソース, B:URL, C:タイトル, D:投稿日, E:引用元, (F:空), G:ポジネガ, H:カテゴリ]
+並び順: MSN → Google → Yahoo（各ソース内は投稿日降順）
 """
 
 import os
@@ -28,12 +25,13 @@ from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
 from webdriver_manager.chrome import ChromeDriverManager
 
+# === Gemini ===
+import google.generativeai as genai
+
 # ====== 設定 ======
 KEYWORD = os.getenv("NEWS_KEYWORD", "日産")
-SPREADSHEET_ID = os.getenv(
-    "SPREADSHEET_ID",
-    "1Vs4Cx8QPN4H2NOgtwaviOCe8zBTpUNDgJjqkHr51IZE"  # 正しい出力先
-)
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "1Vs4Cx8QPN4H2NOgtwaviOCe8zBTpUNDgJjqkHr51IZE")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
 
 # ====== 共通ユーティリティ ======
 def jst_now() -> datetime:
@@ -111,7 +109,6 @@ def fetch_html(url: str, timeout: int = 10):
     return ""
 
 def extract_datetime_from_article(html: str) -> str:
-    """JSON-LD / <time datetime> / OGメタから日時をJSTで返す"""
     if not html: return "取得不可"
     soup = BeautifulSoup(html, "html.parser")
 
@@ -145,12 +142,11 @@ def extract_datetime_from_article(html: str) -> str:
     return "取得不可"
 
 def extract_title_and_source_from_yahoo(html: str):
-    """Yahoo記事/ピックアップから (タイトル, 引用元) を抽出"""
     title, source = "", "Yahoo"
     if not html: return title, source
     soup = BeautifulSoup(html, "html.parser")
 
-    # 1) JSON-LD headline / publisher.name
+    # JSON-LD
     for tag in soup.find_all("script", {"type": "application/ld+json"}):
         try:
             data = json.loads(tag.string or "{}")
@@ -166,12 +162,10 @@ def extract_title_and_source_from_yahoo(html: str):
         except Exception:
             continue
 
-    # 2) <h1>
     if not title:
         h1 = soup.find("h1")
         if h1: title = h1.get_text(strip=True)
 
-    # 3) twitter:title / og:title（"Yahoo!ニュース" は除外）
     if not title:
         tw = soup.find("meta", attrs={"name": "twitter:title", "content": True})
         if tw and tw["content"].strip() != "Yahoo!ニュース":
@@ -181,13 +175,11 @@ def extract_title_and_source_from_yahoo(html: str):
         if og and og["content"].strip() != "Yahoo!ニュース":
             title = og["content"].strip()
 
-    # 4) meta[name="source"]
     if source == "Yahoo":
         src_meta = soup.find("meta", attrs={"name": "source", "content": True})
         if src_meta and src_meta.get("content"):
             source = src_meta["content"].strip() or "Yahoo"
 
-    # 5) 近傍の媒体名候補
     if source == "Yahoo":
         cand = soup.find(["span","div"], string=True)
         if cand:
@@ -198,7 +190,6 @@ def extract_title_and_source_from_yahoo(html: str):
     return title, source
 
 def resolve_yahoo_article_url(html: str, orig_url: str) -> str:
-    """pickupページなら中の /articles/ へ、canonical があればそれへ"""
     if not html:
         return orig_url
     soup = BeautifulSoup(html, "html.parser")
@@ -218,7 +209,6 @@ def chrome_driver():
     opt.add_argument("--disable-dev-shm-usage")
     opt.add_argument("--window-size=1920,1080")
     opt.add_argument("--lang=ja-JP")
-    # ヘッドレス検知を弱める
     opt.add_argument("--disable-blink-features=AutomationControlled")
     opt.add_argument(
         "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -233,7 +223,7 @@ def chrome_driver():
         pass
     return driver
 
-# ====== Google ======
+# ====== 取得：Google ======
 def get_google_news(keyword: str):
     driver = chrome_driver()
     url = f"https://news.google.com/search?q={keyword}&hl=ja&gl=JP&ceid=JP:ja"
@@ -251,15 +241,12 @@ def get_google_news(keyword: str):
             a_tag = art.select_one("a.JtKRv") or art.select_one("a.WwrzSb") or art.select_one("a.DY5T1d") or art.select_one("h3 a")
             time_el = art.select_one("time[datetime]") or art.find("time")
             src_el = art.select_one("div.vr1PYe") or art.select_one("div.SVJrMe")
-            if not a_tag:
-                continue
+            if not a_tag: continue
             title = a_tag.get_text(strip=True)
             href  = a_tag.get("href")
-            if not title or not href:
-                continue
+            if not title or not href: continue
             url = "https://news.google.com" + href[1:] if href.startswith("./") else href
-            if not url.startswith("http"):
-                continue
+            if not url.startswith("http"): continue
 
             pub = "取得不可"
             if time_el and time_el.get("datetime"):
@@ -276,7 +263,7 @@ def get_google_news(keyword: str):
     print(f"✅ Googleニュース: {len(data)} 件（投稿日取得 {with_time} 件）")
     return data
 
-# ====== Yahoo ======
+# ====== 取得：Yahoo ======
 def get_yahoo_news(keyword: str):
     driver = chrome_driver()
     url = f"https://news.yahoo.co.jp/search?p={keyword}&ei=utf-8&categories=domestic,world,business,it,science,life,local"
@@ -305,7 +292,6 @@ def get_yahoo_news(keyword: str):
             title, source = extract_title_and_source_from_yahoo(html)
             pub = extract_datetime_from_article(html)
 
-            # タイトル最低限ガード
             if not title or title == "Yahoo!ニュース":
                 continue
             if pub != "取得不可": with_time += 1
@@ -317,7 +303,7 @@ def get_yahoo_news(keyword: str):
     print(f"✅ Yahoo!ニュース: {len(data)} 件（投稿日取得 {with_time} 件）")
     return data
 
-# ====== MSN（Bing News） ======
+# ====== 取得：MSN（Bing News） ======
 def get_msn_news(keyword: str):
     base = jst_now()
     driver = chrome_driver()
@@ -334,7 +320,6 @@ def get_msn_news(keyword: str):
 
     data, with_time = [], 0
 
-    # 1) data-* 属性付き news-card（最優先）
     cards = soup.select("div.news-card[data-title][data-url]") or []
     for c in cards:
         try:
@@ -359,7 +344,6 @@ def get_msn_news(keyword: str):
         except Exception:
             continue
 
-    # 2) フォールバック：見出しリンク版
     if not data:
         items = soup.select("a.title, h2 a, h3 a, a[href*='/news/']")
         for a in items:
@@ -379,7 +363,6 @@ def get_msn_news(keyword: str):
                         pub = get_last_modified_datetime(href)
                 else:
                     with_time += 1
-                # 出典（近傍のsource要素）なければ MSN
                 source = "MSN"
                 src_el = cont.find(["span","div"], class_=re.compile("source|provider"))
                 if src_el:
@@ -404,15 +387,11 @@ def get_gspread_client():
     return gspread.service_account(filename="credentials.json")
 
 def compute_window(now_jst: datetime):
-    """
-    いつ実行しても「昨日15:00〜今日14:59」を対象
-    シート名は「今日のYYMMDD」に固定（例：8/20実行→250820）
-    """
     today = now_jst.date()
     today_1500 = datetime.combine(today, dtime(hour=15, minute=0))
-    start = today_1500 - timedelta(days=1)
-    end   = today_1500 - timedelta(seconds=1)
-    label = today.strftime("%y%m%d")
+    start = today_1500 - timedelta(days=1)         # 昨日 15:00
+    end   = today_1500 - timedelta(seconds=1)      # 今日 14:59:59
+    label = today.strftime("%y%m%d")               # 今日 → YYMMDD（例：250820）
     return start, end, label
 
 def build_daily_sheet(sh, rows_all: list):
@@ -446,12 +425,12 @@ def build_daily_sheet(sh, rows_all: list):
     for src in ["MSN", "Google", "Yahoo"]:
         ordered.extend(dedup_sort(filtered[src]))
 
-    headers = ["ソース", "URL", "タイトル", "投稿日", "引用元"]
+    headers = ["ソース", "URL", "タイトル", "投稿日", "引用元"]  # A..E
     try:
         ws = sh.worksheet(label)
         ws.clear(); ws.append_row(headers)
     except gspread.exceptions.WorksheetNotFound:
-        ws = sh.add_worksheet(title=label, rows=str(max(2, len(ordered)+5)), cols="5")
+        ws = sh.add_worksheet(title=label, rows=str(max(2, len(ordered)+5)), cols="8")
         ws.append_row(headers)
 
     if ordered:
@@ -460,6 +439,149 @@ def build_daily_sheet(sh, rows_all: list):
         print(f"✅ 集約シート {label}: {len(rows)} 件")
     else:
         print(f"⚠️ 集約シート {label}: 対象記事なし")
+
+    # G/Hヘッダ
+    ws.update("G1", "ポジネガ")
+    ws.update("H1", "カテゴリ")
+
+    return label
+
+# ====== Gemini バッチ分類（無料枠節約） ======
+GEMINI_SYSTEM_PROMPT = """あなたは敏腕雑誌記者です。与えられた「ニュースのタイトル」一覧について、
+各タイトルごとに以下を判定してください。
+①ポジティブ／ネガティブ／ニュートラル のいずれか1つ
+②カテゴリ（以下の中から最も関連性が高い1つだけ）：
+会社、車、車（競合）、技術（EV）、技術（e-POWER）、技術（e-4ORCE）、技術（AD/ADAS）、技術、モータースポーツ、株式、政治・経済、スポーツ、その他
+
+追加ルール：
+- 「会社」カテゴリ：ニッサン、トヨタ、ホンダ、スバル、マツダ、スズキ、ミツビシ、ダイハツの記事は () に企業名を記載。それ以外は「その他」。
+- 「車」カテゴリ：車名が含まれる場合のみ（会社名だけは不可）。新型/現行/旧型 + 名称を () 付で記載（例：新型リーフ、現行セレナ、旧型スカイライン）。日産以外は「車（競合）」。
+- 技術（EV / e-POWER / e-4ORCE / AD/ADAS）：該当すればそれを優先。その他の技術は「技術」。
+- 出力は JSON配列で、各要素は {"row": 数値, "sentiment":"ポジティブ|ネガティブ|ニュートラル", "category":"..."} の形式。行番号 row は与えたIDをそのまま返すこと。
+- タイトル文言は改変しないこと。
+"""
+
+def setup_gemini():
+    if not GEMINI_API_KEY:
+        print("⚠️ GEMINI_API_KEY が未設定のため、分類はスキップします。")
+        return None
+    genai.configure(api_key=GEMINI_API_KEY)
+    return genai.GenerativeModel("gemini-1.5-flash")
+
+def build_batch_prompt(tuples):
+    """
+    tuples: List[(row_index, title)]
+    プロンプト末尾に "データ:" として JSON配列（rowとtitle）を添付
+    """
+    data = [{"row": r, "title": t} for (r, t) in tuples]
+    payload = json.dumps(data, ensure_ascii=False)
+    prompt = GEMINI_SYSTEM_PROMPT + "\n\nデータ:\n" + payload + "\n\n上記に対する回答のみをJSON配列で返してください。余計な説明は不要です。"
+    return prompt
+
+def parse_batch_response(text):
+    """
+    返却テキストからJSON配列を抽出してパース
+    """
+    if not text:
+        return []
+    # まず配列を狙う
+    m = re.search(r"\[\s*\{.*\}\s*\]", text, re.S)
+    if m:
+        try:
+            arr = json.loads(m.group(0))
+            if isinstance(arr, list):
+                return arr
+        except Exception:
+            pass
+    # 単一オブジェクトが返ってきた場合でも拾う
+    m2 = re.search(r"\{.*\}", text, re.S)
+    if m2:
+        try:
+            obj = json.loads(m2.group(0))
+            if isinstance(obj, dict):
+                return [obj]
+        except Exception:
+            pass
+    return []
+
+def classify_titles_in_batches(sh, sheet_name: str, batch_size: int = 80, sleep_sec: float = 0.5):
+    model = setup_gemini()
+    if model is None:
+        return
+
+    ws = sh.worksheet(sheet_name)
+    values = ws.get_all_values()  # 1-indexed in sheet; Pythonリストは0始まり
+    if not values or len(values[0]) < 3:
+        print("⚠️ タイトル列が見つかりません。")
+        return
+
+    # C列タイトルを (row_index, title) で収集（ヘッダ除く: 2行目〜）
+    items = []
+    for idx, row in enumerate(values[1:], start=2):
+        title = row[2] if len(row) > 2 else ""
+        if title:
+            items.append((idx, title))
+
+    if not items:
+        print("⚠️ Gemini分類対象なし。"); return
+
+    results_map = {}  # row_index -> (sentiment, category)
+
+    # バッチに分けて問い合わせ
+    for i in range(0, len(items), batch_size):
+        batch = items[i:i+batch_size]
+        prompt = build_batch_prompt(batch)
+        try:
+            resp = model.generate_content(prompt)
+            text = (resp.text or "").trim() if hasattr(resp, "text") else ""
+        except Exception as e:
+            print(f"Geminiバッチ失敗: {e}")
+            # 最低限、ニュートラル/その他で埋める
+            for r,_ in batch:
+                results_map[r] = ("ニュートラル", "その他")
+            time.sleep(sleep_sec)
+            continue
+
+        arr = parse_batch_response(text)
+        if not arr:
+            # 解析失敗時はニュートラル/その他
+            for r,_ in batch:
+                results_map[r] = ("ニュートラル", "その他")
+        else:
+            # 行番号にマップ
+            covered = set()
+            for obj in arr:
+                try:
+                    r = int(obj.get("row"))
+                    s = str(obj.get("sentiment","")).strip() or "ニュートラル"
+                    c = str(obj.get("category","")).strip() or "その他"
+                    results_map[r] = (s, c)
+                    covered.add(r)
+                except Exception:
+                    continue
+            # 欠落行をデフォルトで埋める
+            for (r, _) in batch:
+                if r not in covered:
+                    results_map[r] = ("ニュートラル", "その他")
+
+        time.sleep(sleep_sec)
+
+    # スプレッドシートへ一括書き込み（G/H）
+    updates = []
+    min_row = 2
+    max_row = max(results_map.keys()) if results_map else 1
+    for r in range(min_row, max_row + 1):
+        if r in results_map:
+            s, c = results_map[r]
+        else:
+            s, c = ("", "")
+        updates.append([s, c])
+
+    if updates:
+        ws.update(f"G{min_row}:H{min_row + len(updates) - 1}", updates, value_input_option="USER_ENTERED")
+        print(f"✅ Geminiバッチ分類完了: {len(items)} タイトル / 呼び出し {((len(items)-1)//batch_size)+1} 回")
+    else:
+        print("⚠️ Gemini分類の書き込み対象がありません。")
 
 # ====== メイン ======
 def main():
@@ -475,14 +597,16 @@ def main():
     yahoo_items  = get_yahoo_news(KEYWORD)
     msn_items    = get_msn_news(KEYWORD)
 
-    # まとめだけ出力（順序制御は build 側で MSN→Google→Yahoo）
     all_items = []
     all_items.extend(msn_items)
     all_items.extend(google_items)
     all_items.extend(yahoo_items)
 
     print("\n--- 集約（まとめシートのみ / A列=ソース / 順=MSN→Google→Yahoo） ---")
-    build_daily_sheet(sh, all_items)
+    sheet_name = build_daily_sheet(sh, all_items)
+
+    print("\n--- Gemini（無料枠節約のバッチ）でポジ/ネガ＆カテゴリ付与（G列/H列） ---")
+    classify_titles_in_batches(sh, sheet_name, batch_size=80, sleep_sec=0.5)
 
 if __name__ == "__main__":
     main()
