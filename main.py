@@ -16,7 +16,7 @@ import google.generativeai as genai
 NEWS_KEYWORD = os.environ.get("NEWS_KEYWORD", "日産")
 SPREADSHEET_ID = os.environ.get("SPREADSHEET_ID")            # 必須
 GCP_SERVICE_ACCOUNT_KEY = os.environ.get("GCP_SERVICE_ACCOUNT_KEY")  # 必須(JSON)
-GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")            # 任意（未設定なら分類スキップ）
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")            # 任意（未設定なら分類はヒューリスティクス）
 
 JST = timezone(timedelta(hours=9))
 
@@ -157,10 +157,7 @@ def fetch_msn_news(keyword: str):
         items.append(("MSN", link, title, pub, src))
     return items
 
-# ================== Yahooニュース（検索→記事抽出）＋コメント数 ==================
-YAHOO_COMMENT_TXT_RE = re.compile(r"コメント[（(]\s*([0-9,]+)\s*[)）]")
-YAHOO_COMMENT_JSON_RE = re.compile(r'"commentCount"\s*:\s*([0-9]+)')
-
+# ================== Yahooニュース（検索→記事抽出）※コメント数は取得しない ==================
 def resolve_yahoo_article_url(html: str, fallback_url: str) -> str:
     if not html:
         return fallback_url
@@ -208,36 +205,11 @@ def extract_yahoo_title_source(html: str) -> tuple[str, str]:
                 title = t
     return title, source
 
-def extract_yahoo_comment_count(html: str) -> int:
-    if not html:
-        return 0
-    soup = BeautifulSoup(html, "html.parser")
-    # 1) JSON-LD / すべての<script>から "commentCount": N を総当り
-    scripts = soup.find_all("script")
-    for sc in scripts:
-        try:
-            txt = sc.string or sc.text or ""
-            m = YAHOO_COMMENT_JSON_RE.search(txt)
-            if m:
-                return int(m.group(1))
-        except Exception:
-            continue
-    # 2) テキストから 「コメント（N）」 を抽出
-    try:
-        text = soup.get_text(" ", strip=True)
-        m = YAHOO_COMMENT_TXT_RE.search(text)
-        if m:
-            return int(m.group(1).replace(",", ""))
-    except Exception:
-        pass
-    return 0
-
 def fetch_yahoo_news(keyword: str):
     url = f"https://news.yahoo.co.jp/search?p={keyword}&ei=utf-8&ts=0&st=n&sr=1&sk=all"
     html = fetch_html(url)
     soup = BeautifulSoup(html, "html.parser")
 
-    # 検索ページから /articles/ と /pickup/ を収集
     cand_urls = []
     for a in soup.find_all("a", href=True):
         href = a["href"]
@@ -247,7 +219,6 @@ def fetch_yahoo_news(keyword: str):
             if href.startswith("http"):
                 cand_urls.append(href)
 
-    # 重複除去
     seen, targets = set(), []
     for u in cand_urls:
         if u not in seen:
@@ -260,8 +231,7 @@ def fetch_yahoo_news(keyword: str):
             html0 = fetch_html(u)
             art_url = resolve_yahoo_article_url(html0, u)
             if "news.yahoo.co.jp/pickup/" in art_url and art_url == u:
-                # pickup -> 記事URL解決できないときはスキップ
-                continue
+                continue  # pickup→記事未解決はスキップ
             html1 = html0 if art_url == u else fetch_html(art_url)
             if not html1:
                 continue
@@ -275,17 +245,18 @@ def fetch_yahoo_news(keyword: str):
                         title = t
 
             pub = extract_datetime_from_article(html1) or fmt_jst(now_jst())
-            comment = extract_yahoo_comment_count(html1)
+
+            # コメント数は取得しない → 空欄
+            comment = ""
 
             items.append(("Yahoo", art_url, title, pub, source, comment))
-            time.sleep(0.25)  # 優しめに
+            time.sleep(0.2)
         except Exception:
             continue
     return items
 
-# ================== Gemini 安定化 ==================
+# ================== Gemini 安定化（JSON強制＋フォールバック） ==================
 def _extract_json_array(text: str):
-    """テキスト中から最初の [ と最後の ] で囲まれた配列を抜き出してJSONロード。失敗時None。"""
     if not text:
         return None
     s = text.find("[")
@@ -298,11 +269,9 @@ def _extract_json_array(text: str):
         return None
 
 def _heuristic_classify(title: str) -> tuple[str, str]:
-    """Gemini失敗時の簡易判定（最低限の穴埋め）。"""
     t = title.lower()
-    # sentiment
-    neg_kw = ["停止", "終了", "撤退", "不祥事", "下落", "否定", "炎上", "事故", "問題", "破談"]
-    pos_kw = ["発表", "受賞", "好調", "上昇", "登場", "公開", "新型", "強化", "受注", "発売"]
+    neg_kw = ["停止", "終了", "撤退", "不祥事", "下落", "否定", "炎上", "事故", "問題", "破談", "人員削減"]
+    pos_kw = ["発表", "受賞", "好調", "上昇", "登場", "公開", "新型", "強化", "受注", "発売", "ラインナップ"]
     sentiment = "ニュートラル"
     if any(k in title for k in neg_kw):
         sentiment = "ネガティブ"
@@ -358,12 +327,10 @@ def classify_titles_gemini_batched(titles: list[str], batch_size: int = 80) -> l
             ])
             text = (getattr(resp, "text", "") or "").strip()
             arr = None
-            # 1) そのままJSONとして読む
             try:
                 if text:
                     arr = json.loads(text)
             except Exception:
-                # 2) コードブロック等から抽出
                 arr = _extract_json_array(text)
             if isinstance(arr, dict):
                 arr = [arr]
@@ -377,7 +344,7 @@ def classify_titles_gemini_batched(titles: list[str], batch_size: int = 80) -> l
                             out[idx] = (s, c)
                     except Exception:
                         continue
-            # 未充填分はヒューリスティクスで埋める
+            # 足りない分はヒューリスティクスで埋める
             for i in range(start, start+len(batch)):
                 if out[i] == ("", ""):
                     out[i] = _heuristic_classify(titles[i])
@@ -385,7 +352,7 @@ def classify_titles_gemini_batched(titles: list[str], batch_size: int = 80) -> l
             print(f"Geminiバッチ失敗: {e}")
             for i in range(start, start+len(batch)):
                 out[i] = _heuristic_classify(titles[i])
-        time.sleep(0.25)
+        time.sleep(0.2)
     return out
 
 # ================== 集約（昨日15:00〜今日14:59、シート名=今日のYYMMDD） ==================
@@ -412,7 +379,7 @@ def build_daily_sheet(sh, msn_items, google_items, yahoo_items):
     # 並び：MSN→Google→Yahoo
     ordered = msn_f + google_f + yahoo_f
 
-    # タイトル一括分類（Gemini→フォールバック）
+    # タイトル一括分類
     titles = [row[2] for row in ordered]
     senti_cate = classify_titles_gemini_batched(titles)
 
@@ -424,17 +391,17 @@ def build_daily_sheet(sh, msn_items, google_items, yahoo_items):
         ws = sh.add_worksheet(title=sheet_name, rows="5000", cols="10")
 
     headers = ["ソース", "URL", "タイトル", "投稿日", "引用元", "コメント数", "ポジネガ", "カテゴリ"]
-    ws.update([headers], "A1:H1")  # values first, then range_name
+    ws.update([headers], "A1:H1")  # values first, then range
 
     rows = []
     for i, row in enumerate(ordered):
         src, url, title, pub, origin = row[:5]
-        comment = row[5] if len(row) > 5 else ""
+        comment = ""  # コメント数は現在スキップ
         s, c = senti_cate[i] if i < len(senti_cate) else ("", "")
         rows.append([src, url, title, pub, origin, comment, s, c])
 
     if rows:
-        ws.update(rows, f"A2:H{len(rows)+1}")  # values first, then range_name
+        ws.update(rows, f"A2:H{len(rows)+1}")  # values first, then range
 
     print(f"🕒 集約期間: {start.strftime('%Y/%m/%d %H:%M')} 〜 {(end - timedelta(minutes=1)).strftime('%Y/%m/%d %H:%M')} → シート名: {sheet_name}")
     print(f"✅ 集約シート {sheet_name}: {len(rows)} 件")
@@ -457,7 +424,7 @@ def main():
     msn_items    = fetch_msn_news(NEWS_KEYWORD)
 
     print(f"✅ Googleニュース: {len(google_items)} 件（投稿日取得 {sum(1 for i in google_items if i[3])} 件）")
-    print(f"✅ Yahoo!ニュース: {len(yahoo_items)} 件（投稿日取得 {sum(1 for i in yahoo_items if i[3])} 件・コメント数取得）")
+    print(f"✅ Yahoo!ニュース: {len(yahoo_items)} 件（投稿日取得 {sum(1 for i in yahoo_items if i[3])} 件）")
     print(f"✅ MSNニュース: {len(msn_items)} 件（投稿日取得/推定 {sum(1 for i in msn_items if i[3])} 件）")
 
     print("\n--- 集約（まとめシートのみ / A列=ソース / 順=MSN→Google→Yahoo） ---")
