@@ -1,10 +1,15 @@
 # -*- coding: utf-8 -*-
 """
 まとめシートのみ出力 / 今日の YYMMDD に、昨日15:00〜今日14:59 の記事を集約
-- MSN：news-card優先＋見出しリンクにフォールバック、記事ページで投稿日補完
-- Yahoo：/articles/ /pickup/ のみ対象、headline優先でタイトル、publisher.name優先で引用元
-- Google：既存のまま（time[datetime]優先＋記事ページ補完）
-- 並び順: MSN → Google → Yahoo（各ソース内は投稿日降順）、A列=ソース
+- MSN：news-card(data-*)を最優先、なければ見出しリンクにフォールバック
+        取得不可時は記事ページの JSON-LD / <time datetime> / OG で日時補完
+        ヘッドレス検知回避＆日本向けテンプレに寄せる（UA, setlang/mkt/cc, スクロール）
+- Yahoo：/articles/ /pickup/ のみ対象。pickup は実体記事URLへ解決してから
+         タイトル=JSON-LD headline優先→<h1>→twitter:title/og:title（"Yahoo!ニュース"は除外）
+         引用元=JSON-LD publisher.name→meta[name="source"]→本文近傍候補
+- Google：従来通り。time[datetime]→記事ページ補完
+- 出力はまとめシートのみ（列: ソース, URL, タイトル, 投稿日, 引用元）
+- 並び順: MSN → Google → Yahoo（各ソース内は投稿日降順）
 """
 
 import os
@@ -27,7 +32,7 @@ from webdriver_manager.chrome import ChromeDriverManager
 KEYWORD = os.getenv("NEWS_KEYWORD", "日産")
 SPREADSHEET_ID = os.getenv(
     "SPREADSHEET_ID",
-    "1Vs4Cx8QPN4H2NOgtwaviOCe8zBTpUNDgJjqkHr51IZE"
+    "1Vs4Cx8QPN4H2NOgtwaviOCe8zBTpUNDgJjqkHr51IZE"  # 正しい出力先
 )
 
 # ====== 共通ユーティリティ ======
@@ -166,7 +171,7 @@ def extract_title_and_source_from_yahoo(html: str):
         h1 = soup.find("h1")
         if h1: title = h1.get_text(strip=True)
 
-    # 3) twitter:title → og:title（"Yahoo!ニュース" は除外）
+    # 3) twitter:title / og:title（"Yahoo!ニュース" は除外）
     if not title:
         tw = soup.find("meta", attrs={"name": "twitter:title", "content": True})
         if tw and tw["content"].strip() != "Yahoo!ニュース":
@@ -182,7 +187,7 @@ def extract_title_and_source_from_yahoo(html: str):
         if src_meta and src_meta.get("content"):
             source = src_meta["content"].strip() or "Yahoo"
 
-    # 5) その他、本文直下の媒体名候補（短いテキスト）
+    # 5) 近傍の媒体名候補
     if source == "Yahoo":
         cand = soup.find(["span","div"], string=True)
         if cand:
@@ -192,6 +197,19 @@ def extract_title_and_source_from_yahoo(html: str):
 
     return title, source
 
+def resolve_yahoo_article_url(html: str, orig_url: str) -> str:
+    """pickupページなら中の /articles/ へ、canonical があればそれへ"""
+    if not html:
+        return orig_url
+    soup = BeautifulSoup(html, "html.parser")
+    a = soup.select_one('a[href*="news.yahoo.co.jp/articles/"]')
+    if a and a.get("href"):
+        return a["href"]
+    can = soup.find("link", rel="canonical")
+    if can and can.get("href"):
+        return can["href"]
+    return orig_url
+
 def chrome_driver():
     opt = Options()
     opt.add_argument("--headless=new")
@@ -200,7 +218,20 @@ def chrome_driver():
     opt.add_argument("--disable-dev-shm-usage")
     opt.add_argument("--window-size=1920,1080")
     opt.add_argument("--lang=ja-JP")
-    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opt)
+    # ヘッドレス検知を弱める
+    opt.add_argument("--disable-blink-features=AutomationControlled")
+    opt.add_argument(
+        "--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    )
+    driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=opt)
+    try:
+        driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {
+            "source": "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        })
+    except Exception:
+        pass
+    return driver
 
 # ====== Google ======
 def get_google_news(keyword: str):
@@ -220,7 +251,7 @@ def get_google_news(keyword: str):
             a_tag = art.select_one("a.JtKRv") or art.select_one("a.WwrzSb") or art.select_one("a.DY5T1d") or art.select_one("h3 a")
             time_el = art.select_one("time[datetime]") or art.find("time")
             src_el = art.select_one("div.vr1PYe") or art.select_one("div.SVJrMe")
-            if not a_tag: 
+            if not a_tag:
                 continue
             title = a_tag.get_text(strip=True)
             href  = a_tag.get("href")
@@ -266,19 +297,20 @@ def get_yahoo_news(keyword: str):
         if href in seen: continue
         seen.add(href)
         try:
-            html = fetch_html(href)
+            html0 = fetch_html(href)
+            real_url = resolve_yahoo_article_url(html0, href)  # pickup→記事へ解決
+            html = fetch_html(real_url) if real_url != href else html0
             if not html: continue
 
-            # タイトル・引用元・日付
             title, source = extract_title_and_source_from_yahoo(html)
             pub = extract_datetime_from_article(html)
-            if pub != "取得不可": with_time += 1
 
-            # 最低限：タイトルが空 or "Yahoo!ニュース" なら捨てる
+            # タイトル最低限ガード
             if not title or title == "Yahoo!ニュース":
                 continue
+            if pub != "取得不可": with_time += 1
 
-            data.append({"タイトル": title, "URL": href, "投稿日": pub, "引用元": source, "ソース": "Yahoo"})
+            data.append({"タイトル": title, "URL": real_url, "投稿日": pub, "引用元": source, "ソース": "Yahoo"})
         except Exception:
             continue
 
@@ -289,35 +321,33 @@ def get_yahoo_news(keyword: str):
 def get_msn_news(keyword: str):
     base = jst_now()
     driver = chrome_driver()
-    url = f"https://www.bing.com/news/search?q={keyword}&qft=sortbydate%3d'1'&setlang=ja-JP&form=YFNR"
+    url = ("https://www.bing.com/news/search"
+           f"?q={keyword}"
+           "&qft=sortbydate%3d'1'&setlang=ja-JP&mkt=ja-JP&cc=JP&form=YFNR")
     driver.get(url)
     time.sleep(5)
-    # 多少スクロールして読み込ませる
-    for _ in range(3):
+    for _ in range(4):
         driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(1.0)
+        time.sleep(1.2)
     soup = BeautifulSoup(driver.page_source, "html.parser")
     driver.quit()
 
     data, with_time = [], 0
 
-    # 1) data-* 属性付きのカード（最優先）
-    cards = soup.select("div.news-card")
-    for card in cards:
+    # 1) data-* 属性付き news-card（最優先）
+    cards = soup.select("div.news-card[data-title][data-url]") or []
+    for c in cards:
         try:
-            title = (card.get("data-title") or "").strip()
-            link  = (card.get("data-url") or "").strip()
-            source = (card.get("data-author") or "").strip() or "MSN"
-            if not title or not link or not link.startswith("http"):
+            title = (c.get("data-title") or "").strip()
+            link  = (c.get("data-url") or "").strip()
+            source = (c.get("data-author") or "").strip() or "MSN"
+            if not title or not link.startswith("http"):
                 continue
-
-            # 相対表記 → JST
-            pub_label = ""
-            span = card.find("span", attrs={"aria-label": True})
-            if span and span.has_attr("aria-label"):
-                pub_label = span["aria-label"].strip()
-            pub = parse_relative_time(pub_label, base)
-
+            lab = ""
+            s = c.find("span", attrs={"aria-label": True})
+            if s and s.has_attr("aria-label"):
+                lab = s["aria-label"].strip()
+            pub = parse_relative_time(lab, base)
             if pub == "取得不可":
                 html = fetch_html(link)
                 pub = extract_datetime_from_article(html)
@@ -325,26 +355,22 @@ def get_msn_news(keyword: str):
                     pub = get_last_modified_datetime(link)
             else:
                 with_time += 1
-
             data.append({"タイトル": title, "URL": link, "投稿日": pub, "引用元": source, "ソース": "MSN"})
         except Exception:
             continue
 
-    # 2) フォールバック：見出しリンクから拾う
+    # 2) フォールバック：見出しリンク版
     if not data:
         items = soup.select("a.title, h2 a, h3 a, a[href*='/news/']")
         for a in items:
             try:
                 href = a.get("href"); title = a.get_text(strip=True)
-                if not href or not title: continue
-                if not href.startswith("http"): continue
-
-                # 近傍の相対時間
-                container = a.find_parent(["div","li","article"]) or soup
+                if not href or not href.startswith("http") or not title:
+                    continue
+                cont = a.find_parent(["div","li","article"]) or soup
                 lab = ""
-                tspan = container.find("span", attrs={"aria-label": True})
-                if tspan and tspan.has_attr("aria-label"):
-                    lab = tspan["aria-label"].strip()
+                s = cont.find("span", attrs={"aria-label": True})
+                if s and s.has_attr("aria-label"): lab = s["aria-label"].strip()
                 pub = parse_relative_time(lab, base)
                 if pub == "取得不可":
                     html = fetch_html(href)
@@ -353,12 +379,11 @@ def get_msn_news(keyword: str):
                         pub = get_last_modified_datetime(href)
                 else:
                     with_time += 1
-
-                # 出典（近傍のsource要素が無い場合は MSN）
+                # 出典（近傍のsource要素）なければ MSN
                 source = "MSN"
-                src = container.find(["span","div"], class_=re.compile("source|provider|source"))
-                if src:
-                    st = src.get_text(strip=True)
+                src_el = cont.find(["span","div"], class_=re.compile("source|provider"))
+                if src_el:
+                    st = src_el.get_text(strip=True)
                     if st: source = st
                 data.append({"タイトル": title, "URL": href, "投稿日": pub, "引用元": source, "ソース": "MSN"})
             except Exception:
@@ -450,7 +475,7 @@ def main():
     yahoo_items  = get_yahoo_news(KEYWORD)
     msn_items    = get_msn_news(KEYWORD)
 
-    # まとめだけ出力（順序制御は build 側で）
+    # まとめだけ出力（順序制御は build 側で MSN→Google→Yahoo）
     all_items = []
     all_items.extend(msn_items)
     all_items.extend(google_items)
