@@ -1,0 +1,42 @@
+name: Daily News Scraper & Aggregator
+
+on:
+  schedule:
+    # 毎日 JST 15:10 に実行（UTC 06:10）
+    - cron: '10 6 * * *'
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: 📦 Check out repository
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 🧰 Install Google Chrome
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg ca-certificates
+          wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt -f install -y
+
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: ▶️ Run scraper & aggregator
+        env:
+          GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+          # 必要に応じてキーワードを変えたいときはSecrets/Variablesで上書きしてください
+          NEWS_KEYWORD: ${{ vars.NEWS_KEYWORD || '日産' }}
+          SPREADSHEET_ID: ${{ vars.SPREADSHEET_ID || '1RglATeTbLU1SqlfXnNToJqhXLdNoHCdePldioKDQgU8' }}
+        run: |
+          python main.py
