@@ -9,7 +9,7 @@ on:
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 25
 
     steps:
       - name: 📦 Check out repository
@@ -26,17 +26,20 @@ jobs:
           sudo apt-get install -y wget gnupg ca-certificates
           wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
           sudo dpkg -i google-chrome-stable_current_amd64.deb || sudo apt -f install -y
+          google-chrome --version
 
-      - name: 📦 Install dependencies
+      - name: 📦 Install Python dependencies
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: ▶️ Run scraper & aggregator
         env:
+          # 必須：サービスアカウントJSONをSecretsに保存し、ここで参照
           GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
-          # 必要に応じてキーワードを変えたいときはSecrets/Variablesで上書きしてください
+          # 任意：キーワード。未設定なら '日産'
           NEWS_KEYWORD: ${{ vars.NEWS_KEYWORD || '日産' }}
-          SPREADSHEET_ID: ${{ vars.SPREADSHEET_ID || '1RglATeTbLU1SqlfXnNToJqhXLdNoHCdePldioKDQgU8' }}
+          # 最優先で正しい出力先に固定
+          SPREADSHEET_ID: 1Vs4Cx8QPN4H2NOgtwaviOCe8zBTpUNDgJjqkHr51IZE
         run: |
           python main.py
