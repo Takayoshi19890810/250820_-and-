@@ -4,5 +4,5 @@ lxml
 gspread
 google-auth
 google-generativeai
-selenium==4.23.1
-webdriver-manager==4.0.2
+selenium>=4.10
+webdriver-manager>=4.0.0
