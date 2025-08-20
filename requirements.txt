@@ -3,3 +3,4 @@ selenium
 webdriver_manager
 requests
 beautifulsoup4
+google-generativeai
