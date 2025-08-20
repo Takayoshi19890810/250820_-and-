@@ -15,13 +15,21 @@ from bs4 import BeautifulSoup
 import gspread
 from google.oauth2.service_account import Credentials
 
+# Selenium (待機＆同意回避対応)
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
 # ========= 基本設定 =========
 JST = timezone(timedelta(hours=9))
 UA = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/120.0.0.0 Safari/537.36"
+        "Chrome/124.0.0.0 Safari/537.36"
     )
 }
 
@@ -30,11 +38,12 @@ SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
 
-USE_WDM = int(os.getenv("USE_WDM", "0"))   # 0: Selenium Manager, 1: webdriver-manager
+# Selenium: Selenium Manager 推奨（USE_WDM=0）。必要なら webdriver-manager を利用（=1）
+USE_WDM = int(os.getenv("USE_WDM", "0"))
 SCROLL_SLEEP = float(os.getenv("SCROLL_SLEEP", "1.2"))
-SCROLLS_GOOGLE = int(os.getenv("SCROLLS_GOOGLE", "5"))
-SCROLLS_YAHOO  = int(os.getenv("SCROLLS_YAHOO", "5"))
-ALLOW_PICKUP_FALLBACK = int(os.getenv("ALLOW_PICKUP_FALLBACK", "1"))  # trueならpickup単体でも拾う
+SCROLLS_GOOGLE = int(os.getenv("SCROLLS_GOOGLE", "6"))
+SCROLLS_YAHOO  = int(os.getenv("SCROLLS_YAHOO", "6"))
+ALLOW_PICKUP_FALLBACK = int(os.getenv("ALLOW_PICKUP_FALLBACK", "1"))
 
 # ========= 共通ヘルパ =========
 def soup(html: str):
@@ -82,21 +91,21 @@ def in_window(pub_str: str, start: datetime, end: datetime) -> bool:
 
 # ========= Selenium =========
 def get_driver():
-    from selenium import webdriver
-    from selenium.webdriver.chrome.options import Options
-    from selenium.webdriver.chrome.service import Service
     options = Options()
     options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--window-size=1280,2000")
     options.add_argument("--lang=ja-JP")
+    options.add_argument("--disable-blink-features=AutomationControlled")
+    options.add_argument(f"--user-agent={UA['User-Agent']}")
+
     if USE_WDM:
         from webdriver_manager.chrome import ChromeDriverManager
         service = Service(ChromeDriverManager().install())
         driver = webdriver.Chrome(service=service, options=options)
     else:
-        driver = webdriver.Chrome(options=options)  # Selenium Manager
+        driver = webdriver.Chrome(options=options)  # Selenium Manager に任せる
     return driver
 
 def smooth_scroll(driver, times=4, sleep=1.2):
@@ -112,55 +121,43 @@ def smooth_scroll(driver, times=4, sleep=1.2):
 # ========= MSN =========
 def fetch_msn(keyword: str):
     items = []
+    driver = None
     try:
         driver = get_driver()
         q = quote(keyword)
         url = f"https://www.bing.com/news/search?q={q}&qft=sortbydate%3d'1'&form=YFNR"
         driver.get(url)
-        time.sleep(3)
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_all_elements_located((By.CSS_SELECTOR, "div,li,article"))
+        )
         smooth_scroll(driver, times=3, sleep=SCROLL_SLEEP)
         sp = soup(driver.page_source)
         driver.quit()
 
         cards = sp.select("div.news-card")
-        now = datetime.now(JST)
+        if not cards:
+            # 代替セレクタ（レイアウト変化時）
+            cards = sp.select("a.title, h2 a, .source a")
+
         for c in cards:
-            title = c.get("data-title", "").strip()
-            url   = c.get("data-url", "").strip()
-            source = c.get("data-author", "").strip() or "MSN"
-
-            # 相対時刻の aria-label があるケースの取り扱い（なければ後でHEAD）
-            label = ""
-            span = c.find("span", attrs={"aria-label": True})
-            if span and span.has_attr("aria-label"):
-                label = span["aria-label"].strip().lower()
-
-            pub = ""
-            if label:
-                pub = _parse_relative_label(label, now)
-            if (not pub) and url:
+            try:
+                title = c.get("data-title", "").strip() if c.has_attr("data-title") else c.get_text(strip=True)
+                url = c.get("data-url", "").strip() if c.has_attr("data-url") else (c.get("href") or "").strip()
+                if not (title and url and url.startswith("http")):
+                    continue
+                source = c.get("data-author", "").strip() if c.has_attr("data-author") else "MSN"
                 pub = parse_last_modified(url)
-
-            if title and url and pub:
-                items.append(("MSN", url, title, pub, source))
+                if pub:
+                    items.append(("MSN", url, title, pub, source))
+            except Exception:
+                continue
     except Exception:
         traceback.print_exc()
+    finally:
+        if driver:
+            try: driver.quit()
+            except: pass
     return items
-
-def _parse_relative_label(label: str, base: datetime) -> str:
-    try:
-        if "分" in label or "min" in label:
-            m = re.search(r"(\d+)", label)
-            if m: return fmt_jst(base - timedelta(minutes=int(m.group(1))))
-        if "時間" in label or "hour" in label:
-            m = re.search(r"(\d+)", label)
-            if m: return fmt_jst(base - timedelta(hours=int(m.group(1))))
-        if "日" in label or "day" in label:
-            m = re.search(r"(\d+)", label)
-            if m: return fmt_jst(base - timedelta(days=int(m.group(1))))
-    except Exception:
-        pass
-    return ""
 
 # ========= Google =========
 def fetch_google(keyword: str):
@@ -168,16 +165,23 @@ def fetch_google(keyword: str):
     driver = None
     try:
         driver = get_driver()
+
+        # 同意画面回避のため、先にトップへアクセスして CONSENT クッキーを投入
+        driver.get("https://news.google.com/?hl=ja&gl=JP&ceid=JP:ja")
+        try:
+            driver.add_cookie({"name": "CONSENT", "value": "YES+1", "domain": ".google.com"})
+        except Exception:
+            pass
+
         q = quote(keyword)
         url = f"https://news.google.com/search?q={q}&hl=ja&gl=JP&ceid=JP:ja"
         driver.get(url)
-        time.sleep(3)
+        WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.CSS_SELECTOR, "article")))
         smooth_scroll(driver, times=SCROLLS_GOOGLE, sleep=SCROLL_SLEEP)
         sp = soup(driver.page_source)
         driver.quit()
 
         seen = set()
-        # Google News 構造：<article> 内に <time datetime> あり
         for art in sp.find_all("article"):
             a = art.find("a", href=True)
             if not a:
@@ -193,6 +197,7 @@ def fetch_google(keyword: str):
                 full = href
             title = a.get_text(strip=True)
 
+            # pub: <time datetime> を最優先
             pub = ""
             t = art.find("time")
             if t and t.has_attr("datetime"):
@@ -202,28 +207,43 @@ def fetch_google(keyword: str):
                 except Exception:
                     pass
 
-            # 最終URL解決（pubが無い場合でもやる）
+            # 最終URL解決 & Last-Modified 補完
             try:
                 r = requests.get(full, headers=UA, timeout=10, allow_redirects=True)
                 final = r.url
             except Exception:
                 final = full
-
             if not pub:
                 pub = parse_last_modified(final)
 
-            source = ""
-            src_div = art.find("div", class_=re.compile("vr1PYe"))
-            if src_div:
-                source = src_div.get_text(strip=True)
-
-            if final in seen:
+            if final in seen or not title or not pub:
                 continue
             seen.add(final)
 
-            if title and final and pub:
-                items.append(("Google", final, title, pub, source or ""))
+            src_div = art.find("div", class_=re.compile("vr1PYe"))
+            source = src_div.get_text(strip=True) if src_div else ""
+            items.append(("Google", final, title, pub, source))
             time.sleep(0.05)
+
+        # RSSフォールバック（0件時）
+        if not items:
+            rss = requests.get(
+                f"https://news.google.com/rss/search?q={q}&hl=ja&gl=JP&ceid=JP:ja",
+                headers=UA,
+                timeout=10
+            ).text
+            sp_rss = soup(rss)
+            for it in sp_rss.find_all("item"):
+                title = it.title.get_text(strip=True) if it.title else ""
+                link = it.link.get_text(strip=True) if it.link else ""
+                pub = it.pubdate.get_text(strip=True) if it.pubdate else ""
+                try:
+                    dt = parsedate_to_datetime(pub).astimezone(JST)
+                    pub = fmt_jst(dt)
+                except Exception:
+                    pub = ""
+                if title and link and pub:
+                    items.append(("Google", link, title, pub, ""))
     except Exception:
         traceback.print_exc()
     finally:
@@ -244,7 +264,9 @@ def fetch_yahoo(keyword: str):
             f"?p={q}&ei=utf-8&categories=domestic,world,business,it,science,life,local"
         )
         driver.get(url)
-        time.sleep(3)
+        WebDriverWait(driver, 10).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, "ul,ol,section,article"))
+        )
         smooth_scroll(driver, times=SCROLLS_YAHOO, sleep=SCROLL_SLEEP)
         sp = soup(driver.page_source)
         driver.quit()
@@ -262,7 +284,7 @@ def fetch_yahoo(keyword: str):
 
         seen = set()
         for u in cand:
-            if u in seen: 
+            if u in seen:
                 continue
             seen.add(u)
 
@@ -302,7 +324,6 @@ def _resolve_yahoo_article_url(html: str, url: str) -> str:
 
 def _extract_yahoo_datetime(html: str) -> str:
     sp = soup(html)
-    # itemprop
     m = sp.find("meta", attrs={"itemprop": "datePublished", "content": True})
     if m:
         try:
@@ -310,7 +331,6 @@ def _extract_yahoo_datetime(html: str) -> str:
             return fmt_jst(dt)
         except Exception:
             pass
-    # <time datetime>
     t = sp.find("time")
     if t and t.has_attr("datetime"):
         try:
@@ -318,7 +338,6 @@ def _extract_yahoo_datetime(html: str) -> str:
             return fmt_jst(dt)
         except Exception:
             pass
-    # テキスト（例: 2025/08/20 09:15）
     if t and t.get_text(strip=True):
         txt = re.sub(r"\([月火水木金土日]\)", "", t.get_text(strip=True))
         try:
@@ -331,16 +350,14 @@ def _extract_yahoo_datetime(html: str) -> str:
 def _extract_yahoo_title(html: str) -> str:
     sp = soup(html)
     h1 = sp.find("h1")
-    if h1:
-        t = h1.get_text(strip=True)
-        if t:
-            return t
+    if h1 and h1.get_text(strip=True):
+        return h1.get_text(strip=True)
     og = sp.find("meta", attrs={"property": "og:title", "content": True})
     if og and og["content"].strip():
         return og["content"].strip()
     return (sp.title.get_text(strip=True) if sp.title else "").strip()
 
-# ========= Gemini 分類（番号+タイトル→4列TSVで返させる） =========
+# ========= Gemini 分類（番号+タイトル → 4列TSVで返させる） =========
 GEMINI_PROMPT = """あなたは敏腕雑誌記者です。 上記Webニュースのタイトルを以下の視点で判断してほしい。
 ①ポジティブ、ネガティブ、ニュートラルの判別。
 ②記事のカテゴリーの判別。　以下に例を記載してほしい。
@@ -398,11 +415,12 @@ def classify_with_gemini(titles):
         for ln in lines:
             parts = [p.strip() for p in ln.split("\t")]
             if len(parts) >= 4:
-                num_str, title_out, senti, cate = parts[0], parts[1], parts[2], parts[3]
+                num_str = parts[0]
                 m = re.match(r"^(\d+)", num_str)
                 if not m:
                     continue
                 idx = int(m.group(1))
+                senti, cate = parts[2], parts[3]
                 results_by_idx[idx] = (senti, cate)
         idx_offset += len(chunk)
 
@@ -436,7 +454,7 @@ def upsert_single_sheet(sh, sheet_name: str, rows: list):
         ws.clear()
     except gspread.exceptions.WorksheetNotFound:
         ws = sh.add_worksheet(title=sheet_name, rows=str(max(1000, len(rows)+10)), cols=str(len(headers)))
-    # gspread の警告対策：values を先、range_name を後
+    # gspread の DeprecationWarning 回避：values を先、range_name を後
     ws.update(values=[headers], range_name="A1:G1")
     if rows:
         ws.update(values=rows, range_name=f"A2:G{len(rows)+1}")
@@ -470,15 +488,15 @@ def main():
 
     print(f"📦 フィルタ後: {len(merged)} 件")
 
+    # シートは毎日1枚（YYMMDD）に集約、分類はAIで必ず実施
     if not merged:
         sh = open_sheet(SPREADSHEET_ID)
         upsert_single_sheet(sh, sheet_name, [])
         print("⚠️ 期間内の記事が見つかりませんでした。")
         return
 
-    # 分類（AI必須）
     titles = [t for (_, _, t, _, _) in merged]
-    labels = classify_with_gemini(titles)  # [(sentiment, category)]
+    labels = classify_with_gemini(titles)  # [(senti, cate)]
 
     def norm_sent(s):
         s = s.strip()
