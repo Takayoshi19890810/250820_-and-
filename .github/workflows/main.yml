@@ -1,15 +1,15 @@
-name: Daily News Scraper & Aggregator
+name: Daily News Scraper & Gemini Classifier
 
 on:
   schedule:
-    # 毎日 JST 15:10 に実行（UTC 06:10）
+    # 毎日 JST 15:10 実行（UTC 06:10）
     - cron: '10 6 * * *'
   workflow_dispatch:
 
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
 
     steps:
       - name: 📦 Check out repository
@@ -33,13 +33,15 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: ▶️ Run scraper & aggregator (summary sheet only)
+      - name: ▶️ Run scraper & batch classifier
         env:
-          # 必須: サービスアカウントJSON（GitHub → Settings → Secrets and variables → Actions → Secrets）
+          # Sheets 認証（サービスアカウントJSON）
           GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
-          # 任意: 検索キーワード（未設定時は '日産'）
+          # Gemini API キー（無料枠）
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          # 検索キーワード（必要に応じて変更可）
           NEWS_KEYWORD: ${{ vars.NEWS_KEYWORD || '日産' }}
-          # 最優先で正しい出力先シートIDを固定
+          # 正しい出力先スプレッドシート（固定）
           SPREADSHEET_ID: 1Vs4Cx8QPN4H2NOgtwaviOCe8zBTpUNDgJjqkHr51IZE
         run: |
           python main.py
