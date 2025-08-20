@@ -3,3 +3,4 @@ beautifulsoup4
 gspread
 google-auth
 google-generativeai
+lxml
