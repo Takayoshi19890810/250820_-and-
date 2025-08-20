@@ -1,6 +1,8 @@
 requests
 beautifulsoup4
+lxml
 gspread
 google-auth
 google-generativeai
-lxml
+selenium==4.23.1
+webdriver-manager==4.0.2
