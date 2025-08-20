@@ -255,6 +255,106 @@ def fetch_yahoo_news(keyword: str):
             continue
     return items
 
+# ================== カテゴリー整形（厳格ルール） ==================
+# 企業ブランド検出（会社カテゴリ用）
+BRAND_PATTERNS = [
+    (re.compile(r"(日産|ニッサン|NISSAN)", re.IGNORECASE), "ニッサン"),
+    (re.compile(r"(トヨタ|TOYOTA)", re.IGNORECASE), "トヨタ"),
+    (re.compile(r"(ホンダ|HONDA)", re.IGNORECASE), "ホンダ"),
+    (re.compile(r"(スバル|SUBARU)", re.IGNORECASE), "スバル"),
+    (re.compile(r"(マツダ|MAZDA)", re.IGNORECASE), "マツダ"),
+    (re.compile(r"(スズキ|SUZUKI)", re.IGNORECASE), "スズキ"),
+    (re.compile(r"(三菱|ミツビシ|MITSUBISHI)", re.IGNORECASE), "ミツビシ"),
+    (re.compile(r"(ダイハツ|DAIHATSU)", re.IGNORECASE), "ダイハツ"),
+]
+
+# ニッサン車名（車カテゴリの表記用）
+NISSAN_MODELS = [
+    "リーフ","セレナ","スカイライン","フェアレディZ","ノート","オーラ","アリア","キックス","エクストレイル",
+    "ジューク","デイズ","ルークス","マーチ","ティアナ","シルビア","GT-R","R35","キャラバン","パトロール",
+    "フロンティア","デュアリス","ラティオ","バネット","ティーダ","サクラ"
+]
+
+GEN_PREFIXES = [("新型","新型"), ("現行","現行"), ("旧型","旧型"), ("先代","旧型")]
+
+def detect_brand_name(title: str) -> str|None:
+    for pat, name in BRAND_PATTERNS:
+        if pat.search(title):
+            return name
+    return None
+
+def detect_nissan_model(title: str) -> str|None:
+    for m in NISSAN_MODELS:
+        if m.lower() in title.lower():
+            return m
+    return None
+
+def build_car_category(title: str) -> str:
+    """車カテゴリの最終表記を返す（ニッサン車は車（新型XXX）等、他社は車（競合））。"""
+    model = detect_nissan_model(title)
+    if model:
+        # 新型/現行/旧型 前置き検出
+        prefix = ""
+        for key, norm in GEN_PREFIXES:
+            if key in title:
+                prefix = norm
+                break
+        label = f"{prefix}{model}" if prefix else model
+        return f"車（{label}）"
+    # ニッサン以外の車名（簡易判定）：他社車名ワードが含まれていそう & 「車/EV/モデル/○○」など
+    # 厳密には辞書が必要だが、要件ではニッサン以外は「車（競合）」固定でOK
+    # 車名らしい単語ヒューリスティクス
+    carish = any(k in title for k in ["新型","モデル","グレード","発表","発売","SUV","セダン","ハッチバック","クーペ","ミニバン"])
+    other_brand = detect_brand_name(title)
+    if other_brand and other_brand != "ニッサン" and carish:
+        return "車（競合）"
+    # 車カテゴリと断定できなければ None（呼び出し側で別カテゴリにする）
+    return None
+
+def build_company_category(title: str) -> str:
+    brand = detect_brand_name(title)
+    return f"会社（{brand if brand else 'その他'}）"
+
+def normalize_category(title: str, gemini_cat: str) -> str:
+    """Geminiのざっくりカテゴリ候補を受け、最終カテゴリ文字列に正規化"""
+    base = (gemini_cat or "").strip()
+    # 技術系はそのまま優先
+    tech_whitelist = [
+        "技術（EV）","技術（e-POWER）","技術（e-4ORCE）","技術（AD/ADAS）","技術",
+        "モータースポーツ","株式","政治・経済","スポーツ","その他"
+    ]
+    if base in tech_whitelist:
+        return base
+
+    # 車の厳格表記
+    if base.startswith("車"):
+        car_cat = build_car_category(title)
+        if car_cat:
+            return car_cat
+        # Geminiが車と言ったが根拠弱い場合は会社扱いにフォールバック
+        return build_company_category(title)
+
+    # 会社は必ず（ブランド）を付与
+    if base == "会社" or base == "企業":
+        return build_company_category(title)
+
+    # 車（競合）と明示された場合はそのまま
+    if base == "車（競合）":
+        return "車（競合）"
+
+    # その他/不明はヒューリスティクス
+    # 明らかに会社っぽい（生産/販売/業績/リコール 等）
+    if any(k in title for k in ["販売", "生産", "リコール", "提携", "統合", "出荷", "出資", "投資", "工場", "雇用", "再建", "撤退", "子会社", "人員"]):
+        return build_company_category(title)
+
+    # 車名を強く含むなら車側に寄せる
+    car_cat = build_car_category(title)
+    if car_cat:
+        return car_cat
+
+    # 最後はその他
+    return "その他"
+
 # ================== Gemini 安定化（JSON強制＋フォールバック） ==================
 def _extract_json_array(text: str):
     if not text:
@@ -268,39 +368,29 @@ def _extract_json_array(text: str):
     except Exception:
         return None
 
-def _heuristic_classify(title: str) -> tuple[str, str]:
-    t = title.lower()
-    neg_kw = ["停止", "終了", "撤退", "不祥事", "下落", "否定", "炎上", "事故", "問題", "破談", "人員削減"]
-    pos_kw = ["発表", "受賞", "好調", "上昇", "登場", "公開", "新型", "強化", "受注", "発売", "ラインナップ"]
-    sentiment = "ニュートラル"
+def _heuristic_sentiment(title: str) -> str:
+    neg_kw = ["停止", "終了", "撤退", "不祥事", "下落", "否定", "炎上", "事故", "問題", "破談", "人員削減", "雇用不安"]
+    pos_kw = ["発表", "受賞", "好調", "上昇", "登場", "公開", "新型", "強化", "受注", "発売", "ラインナップ", "増加"]
     if any(k in title for k in neg_kw):
-        sentiment = "ネガティブ"
-    elif any(k in title for k in pos_kw):
-        sentiment = "ポジティブ"
-    # category
-    if any(k in t for k in ["株", "株価", "決算"]):
-        category = "株式"
-    elif any(k in t for k in ["政治", "首相", "政権", "選挙", "税"]):
-        category = "政治・経済"
-    elif any(k in t for k in ["f1", "ラリー", "フォーミュラ", "スーパーgt"]):
-        category = "モータースポーツ"
-    elif any(k in t for k in ["サッカー", "野球", "mlb", "高校野球", "バレー", "バスケ"]):
-        category = "スポーツ"
-    elif "e-power" in t or "e-4orce" in t:
-        category = "技術"
-    elif any(k in t for k in ["ev", "電気自動車", "バッテリー"]):
-        category = "技術（EV）"
-    elif any(k in t for k in ["nismo", "z ", "スカイライン", "セレナ", "ノート", "リーフ", "パトロール", "ティアナ"]):
-        category = "車"
-    else:
-        category = "会社" if ("日産" in title or "ニッサン" in title) else "その他"
-    return sentiment, category
+        return "ネガティブ"
+    if any(k in title for k in pos_kw):
+        return "ポジティブ"
+    return "ニュートラル"
 
 def classify_titles_gemini_batched(titles: list[str], batch_size: int = 80) -> list[tuple[str, str]]:
+    """戻り値: [(sentiment, normalized_category), ...]"""
     if not titles:
         return []
     if not GEMINI_API_KEY:
-        return [_heuristic_classify(t) for t in titles]
+        # Geminiなし→感情はヒューリスティクス、カテゴリは自力正規化（先に会社/車の当てはめ）
+        out = []
+        for t in titles:
+            s = _heuristic_sentiment(t)
+            # 粗カテゴリ候補を自前推定
+            rough = "会社" if ("日産" in t or "ニッサン" in t) else "その他"
+            norm = normalize_category(t, rough)
+            out.append((s, norm))
+        return out
 
     genai.configure(api_key=GEMINI_API_KEY)
     model = genai.GenerativeModel(
@@ -313,12 +403,12 @@ def classify_titles_gemini_batched(titles: list[str], batch_size: int = 80) -> l
         batch = titles[start:start+batch_size]
         payload = [{"row": start+i, "title": t} for i, t in enumerate(batch)]
         sys_prompt = (
-            "あなたは敏腕雑誌記者です。与えられたタイトルごとに以下を判定して、"
+            "あなたは敏腕雑誌記者です。各タイトルについて以下を判定し、"
             "JSON配列のみで返してください。各要素は "
             '{"row": 数値, "sentiment": "ポジティブ|ネガティブ|ニュートラル", '
             '"category": "会社|車|車（競合）|技術（EV）|技術（e-POWER）|技術（e-4ORCE）|'
             '技術（AD/ADAS）|技術|モータースポーツ|株式|政治・経済|スポーツ|その他"}。'
-            "タイトルは改変しない。カテゴリは最も関連が高い1つのみ。"
+            "タイトルは改変しない。カテゴリは単一。"
         )
         try:
             resp = model.generate_content([
@@ -334,6 +424,7 @@ def classify_titles_gemini_batched(titles: list[str], batch_size: int = 80) -> l
                 arr = _extract_json_array(text)
             if isinstance(arr, dict):
                 arr = [arr]
+            # 反映
             if isinstance(arr, list):
                 for obj in arr:
                     try:
@@ -344,14 +435,18 @@ def classify_titles_gemini_batched(titles: list[str], batch_size: int = 80) -> l
                             out[idx] = (s, c)
                     except Exception:
                         continue
-            # 足りない分はヒューリスティクスで埋める
+            # 正規化＋埋め
             for i in range(start, start+len(batch)):
-                if out[i] == ("", ""):
-                    out[i] = _heuristic_classify(titles[i])
+                s, c = out[i]
+                s = s or _heuristic_sentiment(titles[i])
+                c = normalize_category(titles[i], c or "その他")
+                out[i] = (s, c)
         except Exception as e:
             print(f"Geminiバッチ失敗: {e}")
             for i in range(start, start+len(batch)):
-                out[i] = _heuristic_classify(titles[i])
+                s = _heuristic_sentiment(titles[i])
+                c = normalize_category(titles[i], "その他")
+                out[i] = (s, c)
         time.sleep(0.2)
     return out
 
@@ -379,7 +474,7 @@ def build_daily_sheet(sh, msn_items, google_items, yahoo_items):
     # 並び：MSN→Google→Yahoo
     ordered = msn_f + google_f + yahoo_f
 
-    # タイトル一括分類
+    # タイトル一括分類（Gemini→厳格正規化）
     titles = [row[2] for row in ordered]
     senti_cate = classify_titles_gemini_batched(titles)
 
