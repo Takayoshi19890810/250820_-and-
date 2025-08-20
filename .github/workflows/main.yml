@@ -33,13 +33,13 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: ▶️ Run scraper & aggregator
+      - name: ▶️ Run scraper & aggregator (summary sheet only)
         env:
-          # 必須：サービスアカウントJSONをSecretsに保存し、ここで参照
+          # 必須: サービスアカウントJSON（GitHub → Settings → Secrets and variables → Actions → Secrets）
           GCP_SERVICE_ACCOUNT_KEY: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
-          # 任意：キーワード。未設定なら '日産'
+          # 任意: 検索キーワード（未設定時は '日産'）
           NEWS_KEYWORD: ${{ vars.NEWS_KEYWORD || '日産' }}
-          # 最優先で正しい出力先に固定
+          # 最優先で正しい出力先シートIDを固定
           SPREADSHEET_ID: 1Vs4Cx8QPN4H2NOgtwaviOCe8zBTpUNDgJjqkHr51IZE
         run: |
           python main.py
