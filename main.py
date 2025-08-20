@@ -401,10 +401,11 @@ def build_daily_sheet(sh):
 # ========= メイン =========
 def main():
     print(f"🔎 キーワード: {KEYWORD}")
-    print(f"📄 スプレッドシート: {SPREADSHEET_ID}")
+    print(f"📄 SPREADSHEET_ID(env優先): {SPREADSHEET_ID}")
 
     gc = get_gspread_client()
     sh = gc.open_by_key(SPREADSHEET_ID)
+    print(f"📘 Opened spreadsheet title: {sh.title}")  # 実際に開いた先をログに出す
 
     print("\n--- Google News ---")
     google_items = get_google_news(KEYWORD)
